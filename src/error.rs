@@ -212,6 +212,74 @@ pub enum AppError {
         rollback: String,
     },
 
+    #[error("sqlite operation failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    #[error("project {project} is not registered")]
+    ProjectNotFound { project: String },
+
+    #[error("task {task_id} is not registered")]
+    TaskNotFound { task_id: String },
+
+    #[error("run {run_id} is not registered")]
+    TaskRunNotFound { run_id: String },
+
+    #[error("scheduler lock is held by {owner_id}")]
+    SchedulerAlreadyRunning { owner_id: String },
+
+    #[error("scheduler feature requires a git repository at {path}")]
+    GitRepositoryRequired { path: PathBuf },
+
+    #[error("task {task_id} already has an active run")]
+    TaskAlreadyActive { task_id: String },
+
+    #[error("identity {identity_id} has no available scheduler lease capacity")]
+    IdentityBusy { identity_id: IdentityId },
+
+    #[error("worktree {path} is already leased")]
+    WorktreeBusy { path: PathBuf },
+
+    #[error("run {run_id} cannot transition from {from} to {to}")]
+    InvalidRunTransition {
+        run_id: String,
+        from: String,
+        to: String,
+    },
+
+    #[error("task {task_id} cannot transition from {from} to {to}")]
+    InvalidTaskTransition {
+        task_id: String,
+        from: String,
+        to: String,
+    },
+
+    #[error("scheduler worker for run {run_id} is not active")]
+    WorkerNotActive { run_id: String },
+
+    #[error("scheduler worker spawn failed for run {run_id}: {message}")]
+    WorkerSpawnFailed { run_id: String, message: String },
+
+    #[error("scheduler configuration is invalid: {message}")]
+    InvalidSchedulerConfiguration { message: String },
+
+    #[error("task prompt must be provided via --prompt or --prompt-file")]
+    TaskPromptRequired,
+
+    #[error("task prompt cannot be provided both inline and from file")]
+    TaskPromptConflict,
+
+    #[error("task {task_id} has no stored input to retry")]
+    TaskRetryInputMissing { task_id: String },
+
+    #[error("project {project} already exists")]
+    ProjectAlreadyExists { project: String },
+
+    #[error("unsupported project execution mode {mode}")]
+    UnsupportedProjectExecutionMode { mode: String },
+
+    #[error("scheduler rollout gate scheduler_v1 is disabled for {operation}; run `codex-switch scheduler enable` first")]
+    SchedulerFeatureDisabled { operation: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

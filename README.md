@@ -14,6 +14,9 @@ It is designed around isolated `CODEX_HOME` roots per identity, not around rewri
 - can wrap `codex exec` and `codex app-server`
 - can optionally retry `exec` on retryable auth/rate-limit failures with another healthy identity
 - supports probe-gated ChatGPT workspace forcing for identities that have been validated locally
+- supports durable task orchestration across multiple projects with SQLite-backed scheduler state
+- tracks account leases and worktree leases independently from operator-facing selection state
+- runs scheduler-managed tasks through the App Server runtime and preserves thread continuity when possible
 
 ## Requirements
 
@@ -133,6 +136,25 @@ codex-switch identities workspace-force probe "Personal Plus"
 codex-switch identities workspace-force set "Personal Plus" --status passed --notes "Operator override"
 ```
 
+Task orchestration:
+
+```bash
+codex-switch projects add --name repo-a --repo-root /path/to/repo-a --execution-mode git-worktree
+codex-switch scheduler enable
+codex-switch tasks submit --project repo-a --title "Refactor scheduler" --prompt "Implement durable leases"
+codex-switch tasks follow-up <task-id> --prompt "Address the failing integration test"
+codex-switch tasks list
+codex-switch tasks show <task-id>
+codex-switch tasks explain <task-id>
+codex-switch scheduler tick --once
+codex-switch scheduler health
+codex-switch scheduler run
+codex-switch scheduler gc
+codex-switch scheduler disable
+```
+
+The scheduler rollout gate `scheduler_v1` is disabled by default. Use `codex-switch scheduler enable` before submitting or retrying scheduler-managed tasks. Read-only inspection commands remain available when the rollout gate is off.
+
 ## Runtime Layout
 
 By default, state is stored under `~/.telex-codex-switcher` for backward compatibility with the existing managed runtime layout:
@@ -148,6 +170,9 @@ By default, state is stored under `~/.telex-codex-switcher` for backward compati
 - `shared/thread-leases/`: single-writer thread lease files
 - `shared/turn-states/`: tracked handoff state
 - `shared/task-checkpoints/`: checkpoint fallback artifacts
+- `shared/scheduler/scheduler.db`: SQLite WAL-backed source of truth for projects, tasks, runs, leases, and dispatch decisions
+- `shared/task-artifacts/`: per-run prompts, event streams, and thread snapshots
+- `shared/task-worktrees/`: scheduler-managed per-run workspaces and reusable follow-up worktrees
 
 ## Safety Model
 
@@ -156,7 +181,10 @@ By default, state is stored under `~/.telex-codex-switcher` for backward compati
 - every identity gets its own isolated managed `CODEX_HOME`
 - same-thread continuity shares only `sessions/`, not a full home
 - one active writer per thread is enforced with lease files
+- scheduler account occupancy is enforced with durable SQLite account leases, not with the current manual selection
 - handoff confirmation requires persisted thread history to advance
+- scheduler-managed worktrees are never shared across concurrent active runs
+- Git-backed scheduler worktrees are cleaned up through `git worktree remove --force`, not by deleting the directory directly
 - workspace forcing is only enabled automatically after a recorded successful probe
 - state mutations prefer atomic file replacement and rollback on partial failure
 

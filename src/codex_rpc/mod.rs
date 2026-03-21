@@ -28,6 +28,11 @@ pub trait ThreadRuntime {
     fn resume_thread(&self, identity: &CodexIdentity, thread_id: &str) -> Result<ThreadSnapshot>;
 }
 
+#[derive(Debug)]
+pub struct AppServerSession {
+    process: ManagedAppServerProcess,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppServerCommand {
     program: PathBuf,
@@ -282,6 +287,33 @@ impl CodexAppServerVerifier {
     }
 }
 
+impl AppServerSession {
+    pub fn connect(
+        command: &AppServerCommand,
+        codex_home: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut process = ManagedAppServerProcess::spawn(command, codex_home, timeout)?;
+        process.initialize()?;
+        Ok(Self { process })
+    }
+
+    pub fn request<T>(&mut self, method: &str, params: Option<Value>) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.process.request(method, params)
+    }
+
+    pub fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+        self.process.send_notification(method, params)
+    }
+
+    pub fn next_message(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        self.process.next_message(timeout)
+    }
+}
+
 impl IdentityVerifier for CodexAppServerVerifier {
     fn verify(&self, identity: &CodexIdentity) -> Result<IdentityVerification> {
         sync_managed_config(identity)?;
@@ -349,6 +381,7 @@ impl WorkspaceForceProber for CodexAppServerVerifier {
     }
 }
 
+#[derive(Debug)]
 struct ManagedAppServerProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
@@ -492,6 +525,18 @@ impl ManagedAppServerProcess {
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
         Ok(())
+    }
+
+    fn next_message(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        match self.stdout_messages.recv_timeout(timeout) {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(AppError::AppServerExited {
+                method: "notification".to_string(),
+                stderr: self.stderr_text(),
+            }),
+        }
     }
 
     fn stderr_text(&self) -> String {

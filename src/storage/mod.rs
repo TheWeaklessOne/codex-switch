@@ -8,3 +8,4 @@ pub mod selection_event_store;
 pub mod selection_store;
 pub mod thread_lease_store;
 pub mod turn_state_store;
+pub mod worktree_copy;

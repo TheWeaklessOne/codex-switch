@@ -1,3 +1,5 @@
+mod task_orchestration;
+
 use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
@@ -49,6 +51,9 @@ use crate::workspace_switching::{
     inject_auth_into_home, validate_workspace_force_identity, UpdateWorkspaceForceProbeRequest,
     WorkspaceForceProbeOutcome, WorkspaceSwitchingService,
 };
+use task_orchestration::{
+    run_projects, run_scheduler, run_tasks, ProjectsCommand, SchedulerCommand, TasksCommand,
+};
 
 pub fn run<I, T>(arguments: I) -> Result<()>
 where
@@ -67,6 +72,9 @@ where
         Command::AppServer(command) => run_app_server(command),
         Command::Continue(command) => run_continue(command),
         Command::Threads(command) => run_threads(command),
+        Command::Projects(command) => run_projects(command),
+        Command::Tasks(command) => run_tasks(command),
+        Command::Scheduler(command) => run_scheduler(command),
     }
 }
 
@@ -89,6 +97,9 @@ enum Command {
     AppServer(AppServerWrapperCommand),
     Continue(ContinueCommand),
     Threads(ThreadsCommand),
+    Projects(ProjectsCommand),
+    Tasks(TasksCommand),
+    Scheduler(SchedulerCommand),
 }
 
 #[derive(Debug, Args)]
@@ -2201,7 +2212,9 @@ fn detect_default_codex_identity_ids<'a>(
     let Some(default_auth) = default_auth else {
         return matches;
     };
-    let default_marker = read_auth_identity_marker(&default_home.join("auth.json")).ok().flatten();
+    let default_marker = read_auth_identity_marker(&default_home.join("auth.json"))
+        .ok()
+        .flatten();
 
     for identity in identities {
         let auth_path = identity.codex_home.join("auth.json");

@@ -127,6 +127,59 @@ pub fn task_checkpoint_path(base_root: &Path, checkpoint_id: &str) -> PathBuf {
     task_checkpoints_path(base_root).join(format!("{checkpoint_id}.json"))
 }
 
+pub fn scheduler_root_path(base_root: &Path) -> PathBuf {
+    base_root.join("shared").join("scheduler")
+}
+
+pub fn scheduler_db_path(base_root: &Path) -> PathBuf {
+    scheduler_root_path(base_root).join("scheduler.db")
+}
+
+pub fn task_artifacts_path(base_root: &Path) -> PathBuf {
+    base_root.join("shared").join("task-artifacts")
+}
+
+pub fn task_artifact_run_path(base_root: &Path, task_id: &str, run_id: &str) -> PathBuf {
+    task_artifacts_path(base_root).join(task_id).join(run_id)
+}
+
+pub fn task_artifact_prompt_path(base_root: &Path, task_id: &str, run_id: &str) -> PathBuf {
+    task_artifact_run_path(base_root, task_id, run_id).join("prompt.txt")
+}
+
+pub fn task_artifact_events_path(base_root: &Path, task_id: &str, run_id: &str) -> PathBuf {
+    task_artifact_run_path(base_root, task_id, run_id).join("events.jsonl")
+}
+
+pub fn task_artifact_thread_snapshot_path(
+    base_root: &Path,
+    task_id: &str,
+    run_id: &str,
+) -> PathBuf {
+    task_artifact_run_path(base_root, task_id, run_id).join("thread-snapshot.json")
+}
+
+pub fn task_worktrees_path(base_root: &Path) -> PathBuf {
+    base_root.join("shared").join("task-worktrees")
+}
+
+pub fn task_worktree_project_path(base_root: &Path, project_id: &str) -> PathBuf {
+    task_worktrees_path(base_root).join(project_id)
+}
+
+pub fn task_worktree_task_path(base_root: &Path, project_id: &str, task_id: &str) -> PathBuf {
+    task_worktree_project_path(base_root, project_id).join(task_id)
+}
+
+pub fn task_worktree_run_path(
+    base_root: &Path,
+    project_id: &str,
+    task_id: &str,
+    run_id: &str,
+) -> PathBuf {
+    task_worktree_task_path(base_root, project_id, task_id).join(run_id)
+}
+
 pub fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {

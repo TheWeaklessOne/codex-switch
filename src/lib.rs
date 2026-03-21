@@ -18,6 +18,7 @@ pub mod quota_status;
 pub mod selection_policy;
 pub mod shared_session_store;
 pub mod storage;
+pub mod task_orchestration;
 pub mod thread_leases;
 pub mod turn_state;
 pub mod workspace_switching;
