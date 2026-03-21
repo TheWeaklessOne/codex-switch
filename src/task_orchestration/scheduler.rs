@@ -77,7 +77,7 @@ impl SchedulerDaemon {
         let owner_id = scheduler_owner_id();
         let mut store = SchedulerStore::open(&self.base_root)?;
         store.acquire_scheduler_lock(&owner_id, self.settings.scheduler_lock_ttl)?;
-        let result = self.tick_iteration(&mut store, true);
+        let result = self.tick_iteration(&mut store, true, &owner_id);
         let release_result = store.release_scheduler_lock(&owner_id);
         match (result, release_result) {
             (Ok(outcomes), Ok(())) => Ok(outcomes),
@@ -91,8 +91,7 @@ impl SchedulerDaemon {
         let mut store = SchedulerStore::open(&self.base_root)?;
         store.acquire_scheduler_lock(&owner_id, self.settings.scheduler_lock_ttl)?;
         loop {
-            self.tick_iteration(&mut store, false)?;
-            store.heartbeat_scheduler_lock(&owner_id, self.settings.scheduler_lock_ttl)?;
+            self.tick_iteration(&mut store, false, &owner_id)?;
             thread::sleep(self.settings.scheduler_poll_interval);
         }
     }
@@ -114,19 +113,30 @@ impl SchedulerDaemon {
     }
 
     pub fn gc(&self) -> Result<Vec<PathBuf>> {
+        let owner_id = scheduler_owner_id();
         let mut store = SchedulerStore::open(&self.base_root)?;
-        self.gc_inner(&mut store, current_timestamp()?, true)
+        store.acquire_scheduler_lock(&owner_id, self.settings.scheduler_lock_ttl)?;
+        let result = self.gc_inner(&mut store, current_timestamp()?, true, Some(&owner_id));
+        let release_result = store.release_scheduler_lock(&owner_id);
+        match (result, release_result) {
+            (Ok(removed), Ok(())) => Ok(removed),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     fn tick_iteration(
         &self,
         store: &mut SchedulerStore,
         force_maintenance: bool,
+        owner_id: &str,
     ) -> Result<Vec<DispatchOutcome>> {
         let now = current_timestamp()?;
         let control = store.scheduler_control()?;
-        self.run_maintenance(store, &control, now, force_maintenance)?;
-        self.tick_inner(store, &control)
+        self.heartbeat_lock(store, owner_id)?;
+        self.run_maintenance(store, &control, now, force_maintenance, owner_id)?;
+        self.heartbeat_lock(store, owner_id)?;
+        self.tick_inner(store, &control, owner_id)
     }
 
     fn run_maintenance(
@@ -135,6 +145,7 @@ impl SchedulerDaemon {
         control: &SchedulerControlRecord,
         now: i64,
         force: bool,
+        owner_id: &str,
     ) -> Result<()> {
         if should_run_interval(
             control.last_quota_refresh_at,
@@ -142,10 +153,12 @@ impl SchedulerDaemon {
             self.settings.quota_refresh_interval,
             force,
         ) {
+            self.heartbeat_lock(store, owner_id)?;
             self.refresh_quota(store, now)?;
         }
         if should_run_interval(control.last_gc_at, now, self.settings.gc_interval, force) {
-            let _ = self.gc_inner(store, now, false)?;
+            self.heartbeat_lock(store, owner_id)?;
+            let _ = self.gc_inner(store, now, false, Some(owner_id))?;
         }
         Ok(())
     }
@@ -154,9 +167,11 @@ impl SchedulerDaemon {
         &self,
         store: &mut SchedulerStore,
         control: &SchedulerControlRecord,
+        owner_id: &str,
     ) -> Result<Vec<DispatchOutcome>> {
         let now = current_timestamp()?;
         let _ = store.reconcile_orphaned_runs(now, &self.settings)?;
+        self.heartbeat_lock(store, owner_id)?;
         if !control.scheduler_v1_enabled {
             return Ok(Vec::new());
         }
@@ -172,6 +187,7 @@ impl SchedulerDaemon {
 
         let mut dispatched = Vec::new();
         for queued_run in queued.into_iter().take(self.settings.dispatch_batch_size) {
+            self.heartbeat_lock(store, owner_id)?;
             if let Some(outcome) =
                 self.dispatch_run(store, &context, &lease_counts, &runtime_map, queued_run)?
             {
@@ -179,6 +195,10 @@ impl SchedulerDaemon {
             }
         }
         Ok(dispatched)
+    }
+
+    fn heartbeat_lock(&self, store: &mut SchedulerStore, owner_id: &str) -> Result<()> {
+        store.heartbeat_scheduler_lock(owner_id, self.settings.scheduler_lock_ttl)
     }
 
     fn refresh_quota(&self, store: &mut SchedulerStore, now: i64) -> Result<()> {
@@ -207,25 +227,57 @@ impl SchedulerDaemon {
         Ok(())
     }
 
-    fn gc_inner(&self, store: &mut SchedulerStore, now: i64, strict: bool) -> Result<Vec<PathBuf>> {
+    fn gc_inner(
+        &self,
+        store: &mut SchedulerStore,
+        now: i64,
+        strict: bool,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
         let candidates = store.gc_worktrees(now)?;
         let mut removed = Vec::new();
         let mut errors = Vec::new();
         for worktree in candidates {
-            let project = match store.get_project(worktree.project_id.as_str()) {
+            if let Some(owner_id) = owner_id {
+                self.heartbeat_lock(store, owner_id)?;
+            }
+            let Some(reserved_worktree) =
+                store.reserve_worktree_for_gc(&worktree.worktree_id, now)?
+            else {
+                continue;
+            };
+            let project = match store.get_project(reserved_worktree.project_id.as_str()) {
                 Ok(project) => project,
                 Err(error) => {
-                    errors.push(format!("{}: {error}", worktree.path.display()));
+                    let _ = store.release_worktree_gc_reservation(
+                        &reserved_worktree.worktree_id,
+                        reserved_worktree.state,
+                    );
+                    errors.push(format!("{}: {error}", reserved_worktree.path.display()));
                     continue;
                 }
             };
-            match self.worktree_manager.cleanup(&project, &worktree.path) {
-                Ok(()) => match store.delete_worktree(&worktree) {
-                    Ok(true) => removed.push(worktree.path.clone()),
-                    Ok(false) => {}
-                    Err(error) => errors.push(format!("{}: {error}", worktree.path.display())),
+            match self
+                .worktree_manager
+                .cleanup(&project, &reserved_worktree.path)
+            {
+                Ok(()) => match store.delete_worktree(&reserved_worktree) {
+                    Ok(true) => removed.push(reserved_worktree.path.clone()),
+                    Ok(false) => errors.push(format!(
+                        "{}: gc reservation lost before delete",
+                        reserved_worktree.path.display()
+                    )),
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", reserved_worktree.path.display()))
+                    }
                 },
-                Err(error) => errors.push(format!("{}: {error}", worktree.path.display())),
+                Err(error) => {
+                    let _ = store.release_worktree_gc_reservation(
+                        &reserved_worktree.worktree_id,
+                        reserved_worktree.state,
+                    );
+                    errors.push(format!("{}: {error}", reserved_worktree.path.display()));
+                }
             }
         }
         let error_summary = (!errors.is_empty()).then(|| errors.join("; "));
@@ -275,7 +327,7 @@ impl SchedulerDaemon {
             project_id: project.project_id.clone(),
             identity_id: selected.identity.id.clone(),
             worktree: selected.worktree.clone(),
-            worker_owner_id: format!("worker-assigned-{}", run.run_id),
+            worker_owner_id: lease_owner_id(run.run_id.as_str()),
             launch_mode: selected.launch_mode,
             lineage_mode: selected.lineage_mode,
             reason: selected.reason.clone(),
@@ -306,8 +358,18 @@ impl SchedulerDaemon {
         if !store.claim_assignment(&claim, &self.settings)? {
             return Ok(None);
         }
-        let worker_pid = self.spawn_worker(run.run_id.as_str())?;
-        store.mark_worker_spawned(run.run_id.as_str(), worker_pid)?;
+        let worker_pid = match self.spawn_worker(run.run_id.as_str(), &claim.worker_owner_id) {
+            Ok(worker_pid) => worker_pid,
+            Err(error) => {
+                let _ = store.rollback_assignment_after_spawn_failure(
+                    run.run_id.as_str(),
+                    &claim.worker_owner_id,
+                    &error.to_string(),
+                )?;
+                return Ok(None);
+            }
+        };
+        store.mark_worker_spawned(run.run_id.as_str(), &claim.worker_owner_id, worker_pid)?;
         Ok(Some(DispatchOutcome {
             task_id: task.task_id.clone(),
             run_id: run.run_id.clone(),
@@ -317,13 +379,15 @@ impl SchedulerDaemon {
         }))
     }
 
-    fn spawn_worker(&self, run_id: &str) -> Result<u32> {
+    fn spawn_worker(&self, run_id: &str, worker_owner_id: &str) -> Result<u32> {
         let mut command = Command::new(&self.worker_program);
         command
             .arg("scheduler")
             .arg("worker")
             .arg("--run-id")
             .arg(run_id)
+            .arg("--lease-owner-id")
+            .arg(worker_owner_id)
             .arg("--base-root")
             .arg(&self.base_root)
             .stdin(Stdio::null())
@@ -615,6 +679,10 @@ fn scheduler_owner_id() -> String {
     format!("scheduler-{}", std::process::id())
 }
 
+fn lease_owner_id(run_id: &str) -> String {
+    format!("worker-lease-{run_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -670,12 +738,17 @@ mod tests {
         let temp = tempdir().unwrap();
         let daemon = SchedulerDaemon::new(temp.path(), SchedulerSettings::default()).unwrap();
         let mut store = SchedulerStore::open(temp.path()).unwrap();
+        store
+            .acquire_scheduler_lock("scheduler-test", Duration::from_secs(60))
+            .unwrap();
 
         let before = store.scheduler_control().unwrap();
         assert!(before.last_quota_refresh_at.is_none());
         assert!(before.last_gc_at.is_none());
 
-        let outcomes = daemon.tick_iteration(&mut store, true).unwrap();
+        let outcomes = daemon
+            .tick_iteration(&mut store, true, "scheduler-test")
+            .unwrap();
         assert!(outcomes.is_empty());
 
         let after = store.scheduler_control().unwrap();
@@ -803,7 +876,12 @@ mod tests {
 
         assert!(worktree.path.exists());
         let daemon = SchedulerDaemon::new(temp.path(), SchedulerSettings::default()).unwrap();
-        let removed = daemon.gc_inner(&mut store, i64::MAX, true).unwrap();
+        store
+            .acquire_scheduler_lock("scheduler-test", Duration::from_secs(60))
+            .unwrap();
+        let removed = daemon
+            .gc_inner(&mut store, i64::MAX, true, Some("scheduler-test"))
+            .unwrap();
         assert_eq!(removed, vec![worktree.path.clone()]);
         assert!(!worktree.path.exists());
         assert!(store.gc_worktrees(i64::MAX).unwrap().is_empty());

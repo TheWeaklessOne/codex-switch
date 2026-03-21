@@ -18,7 +18,11 @@ pub fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     }
 
     ensure_directory(destination, 0o700)?;
-    copy_directory_entries(source, destination)
+    if let Err(error) = copy_directory_entries(source, destination) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn copy_directory_entries(source: &Path, destination: &Path) -> Result<()> {
@@ -47,6 +51,9 @@ fn copy_directory_entries(source: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use std::fs;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use tempfile::tempdir;
 
     use super::copy_workspace_tree;
@@ -70,5 +77,23 @@ mod tests {
             fs::read_to_string(destination.join("nested").join("note.txt")).unwrap(),
             "world"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_partial_destination_when_copy_fails() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "hello").unwrap();
+        symlink(source.join("README.md"), source.join("bad-link")).unwrap();
+
+        let error = copy_workspace_tree(&source, &destination).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::AppError::UnexpectedSymlink { .. }
+        ));
+        assert!(!destination.exists());
     }
 }

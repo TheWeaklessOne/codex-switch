@@ -4,7 +4,8 @@ use std::process::Command;
 
 use crate::error::{AppError, Result};
 use crate::storage::paths::{
-    ensure_directory, task_worktree_run_path, task_worktree_task_path, task_worktrees_path,
+    atomic_write, ensure_directory, task_worktree_run_path, task_worktree_task_path,
+    task_worktrees_path,
 };
 use crate::storage::worktree_copy::copy_workspace_tree;
 use crate::task_orchestration::domain::{ProjectExecutionMode, ProjectRecord, TaskId, TaskRunId};
@@ -33,7 +34,7 @@ impl WorktreeManager {
     ) -> Result<WorktreeMaterialization> {
         self.ensure_base_directories(base_root)?;
         if let Some(existing_path) = existing_path {
-            if existing_path.exists() {
+            if existing_path.exists() && worktree_ready_marker_path(existing_path).exists() {
                 return Ok(WorktreeMaterialization {
                     path: existing_path.to_path_buf(),
                     reused: true,
@@ -50,12 +51,16 @@ impl WorktreeManager {
             task_id.as_str(),
             run_id.as_str(),
         );
+        if target.exists() && !worktree_ready_marker_path(&target).exists() {
+            self.cleanup(project, &target)?;
+        }
         match project.execution_mode {
             ProjectExecutionMode::GitWorktree => add_git_worktree(&project.repo_root, &target)?,
             ProjectExecutionMode::CopyWorkspace => {
                 copy_workspace_tree(&project.repo_root, &target)?
             }
         }
+        write_worktree_ready_marker(&target)?;
         Ok(WorktreeMaterialization {
             path: target,
             reused: false,
@@ -74,6 +79,14 @@ impl WorktreeManager {
         }
         Ok(())
     }
+}
+
+fn worktree_ready_marker_path(path: &Path) -> PathBuf {
+    path.join(".codex-switch-ready")
+}
+
+fn write_worktree_ready_marker(path: &Path) -> Result<()> {
+    atomic_write(&worktree_ready_marker_path(path), b"ready\n", 0o600)
 }
 
 fn add_git_worktree(repo_root: &Path, destination: &Path) -> Result<()> {
@@ -181,9 +194,48 @@ mod tests {
             .unwrap();
 
         assert!(materialized.path.exists());
+        assert!(materialized.path.join(".codex-switch-ready").exists());
         assert_eq!(
             fs::read_to_string(materialized.path.join("src").join("lib.rs")).unwrap(),
             "pub fn hello() {}"
         );
+    }
+
+    #[test]
+    fn does_not_reuse_existing_path_without_ready_marker() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(repo_root.join("src")).unwrap();
+        fs::write(repo_root.join("src").join("lib.rs"), "pub fn hello() {}").unwrap();
+        let stale_path = temp.path().join("stale");
+        fs::create_dir_all(&stale_path).unwrap();
+        fs::write(stale_path.join("partial.txt"), "partial").unwrap();
+        let project = ProjectRecord {
+            project_id: ProjectId::from_string("project-1"),
+            name: "demo".to_string(),
+            repo_root: repo_root.clone(),
+            execution_mode: ProjectExecutionMode::CopyWorkspace,
+            default_codex_args: Vec::new(),
+            default_model_or_profile: None,
+            env_allowlist: Vec::new(),
+            cleanup_policy: CleanupPolicy::default(),
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let manager = WorktreeManager;
+        let materialized = manager
+            .materialize(
+                temp.path(),
+                &project,
+                &TaskId::from_string("task-1"),
+                &TaskRunId::from_string("run-2"),
+                Some(&stale_path),
+            )
+            .unwrap();
+
+        assert!(!materialized.reused);
+        assert_ne!(materialized.path, stale_path);
+        assert!(materialized.path.join(".codex-switch-ready").exists());
     }
 }

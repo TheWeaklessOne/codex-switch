@@ -145,6 +145,7 @@ pub enum SchedulerSubcommand {
     Tick(SchedulerTickCommand),
     Health(SchedulerHealthCommand),
     Gc(SchedulerGcCommand),
+    ResetState(SchedulerResetStateCommand),
     Enable(SchedulerToggleCommand),
     Disable(SchedulerToggleCommand),
     #[command(hide = true)]
@@ -178,6 +179,12 @@ pub struct SchedulerGcCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct SchedulerResetStateCommand {
+    #[arg(long)]
+    pub base_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct SchedulerToggleCommand {
     #[arg(long)]
     pub base_root: Option<PathBuf>,
@@ -187,6 +194,8 @@ pub struct SchedulerToggleCommand {
 pub struct SchedulerWorkerCommand {
     #[arg(long)]
     pub run_id: String,
+    #[arg(long)]
+    pub lease_owner_id: String,
     #[arg(long)]
     pub base_root: Option<PathBuf>,
 }
@@ -459,8 +468,12 @@ pub fn run_tasks(command: TasksCommand) -> Result<()> {
         TasksSubcommand::Cancel(command) => {
             let base_root = resolve_base_root(command.base_root.as_deref())?;
             let mut store = SchedulerStore::open(&base_root)?;
-            store.cancel_task(&command.task_id)?;
+            let outcome = store.cancel_task(&command.task_id)?;
+            let interrupted = interrupt_task_runs(&outcome);
             println!("task canceled: {}", command.task_id);
+            if interrupted > 0 {
+                println!("interrupted runs: {interrupted}");
+            }
             Ok(())
         }
         TasksSubcommand::Retry(command) => {
@@ -582,6 +595,13 @@ pub fn run_scheduler(command: SchedulerCommand) -> Result<()> {
             }
             Ok(())
         }
+        SchedulerSubcommand::ResetState(command) => {
+            let base_root = resolve_base_root(command.base_root.as_deref())?;
+            SchedulerStore::reset_state(&base_root)?;
+            let _ = SchedulerStore::open(&base_root)?;
+            println!("scheduler state reset: {}", base_root.display());
+            Ok(())
+        }
         SchedulerSubcommand::Enable(command) => {
             let base_root = resolve_base_root(command.base_root.as_deref())?;
             let mut store = SchedulerStore::open(&base_root)?;
@@ -612,8 +632,41 @@ pub fn run_scheduler(command: SchedulerCommand) -> Result<()> {
         }
         SchedulerSubcommand::Worker(command) => {
             let base_root = resolve_base_root(command.base_root.as_deref())?;
-            TaskRuntimeWorker::new(&base_root, SchedulerSettings::default()).run(&command.run_id)
+            TaskRuntimeWorker::new(&base_root, SchedulerSettings::default())
+                .run(&command.run_id, &command.lease_owner_id)
         }
+    }
+}
+
+fn interrupt_task_runs(outcome: &crate::task_orchestration::store::CancelTaskOutcome) -> usize {
+    outcome
+        .interrupted_runs
+        .iter()
+        .filter_map(|run| run.worker_pid)
+        .filter(|pid| terminate_process_group(*pid))
+        .count()
+}
+
+fn terminate_process_group(pid: u32) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        let process_group = -(pid as i32);
+        if libc::kill(process_group, libc::SIGTERM) != 0 {
+            return false;
+        }
+        for _ in 0..10 {
+            if libc::kill(pid as i32, 0) != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        libc::kill(process_group, libc::SIGKILL) == 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 

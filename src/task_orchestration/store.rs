@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use crate::error::{AppError, Result};
 use crate::storage::paths::{
     atomic_write, ensure_directory, scheduler_db_path, scheduler_root_path,
     task_artifact_events_path, task_artifact_prompt_path, task_artifact_run_path,
+    task_artifacts_path, task_worktrees_path,
 };
 use crate::task_orchestration::config::{SchedulerControlRecord, SchedulerSettings};
 use crate::task_orchestration::domain::*;
@@ -304,6 +306,18 @@ pub struct RunCompletion {
     pub last_identity_id: Option<IdentityId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CancelTaskOutcome {
+    pub task_id: TaskId,
+    pub interrupted_runs: Vec<CanceledRunRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanceledRunRecord {
+    pub run_id: TaskRunId,
+    pub worker_pid: Option<u32>,
+}
+
 #[derive(Debug)]
 pub struct SchedulerStore {
     base_root: PathBuf,
@@ -311,6 +325,22 @@ pub struct SchedulerStore {
 }
 
 impl SchedulerStore {
+    pub fn reset_state(base_root: &Path) -> Result<()> {
+        let scheduler_root = scheduler_root_path(base_root);
+        if scheduler_root.exists() {
+            fs::remove_dir_all(&scheduler_root)?;
+        }
+        let task_artifacts = task_artifacts_path(base_root);
+        if task_artifacts.exists() {
+            fs::remove_dir_all(&task_artifacts)?;
+        }
+        let task_worktrees = task_worktrees_path(base_root);
+        if task_worktrees.exists() {
+            fs::remove_dir_all(&task_worktrees)?;
+        }
+        Ok(())
+    }
+
     pub fn open(base_root: &Path) -> Result<Self> {
         ensure_directory(&scheduler_root_path(base_root), 0o700)?;
         let path = scheduler_db_path(base_root);
@@ -620,12 +650,6 @@ impl SchedulerStore {
             prompt_file_path: request.prompt_file_path,
             created_at: now,
         };
-        persist_run_prompt(
-            &self.base_root,
-            &task.task_id,
-            &run.run_id,
-            &input.prompt_text,
-        )?;
         let tx = self.connection.transaction()?;
         insert_task_tx(&tx, &task)?;
         insert_run_tx(&tx, &run)?;
@@ -647,6 +671,7 @@ impl SchedulerStore {
             )?,
         )?;
         tx.commit()?;
+        self.persist_prompt_artifacts_after_commit(&task.task_id, &run.run_id, &input.prompt_text);
         Ok(TaskLineageSnapshot {
             task,
             runs: vec![run.clone()],
@@ -677,12 +702,6 @@ impl SchedulerStore {
             prompt_file_path: request.prompt_file_path,
             created_at: now,
         };
-        persist_run_prompt(
-            &self.base_root,
-            &task.task_id,
-            &run.run_id,
-            &input.prompt_text,
-        )?;
         let tx = self.connection.transaction()?;
         insert_run_tx(&tx, &run)?;
         insert_run_input_tx(&tx, &input)?;
@@ -706,6 +725,7 @@ impl SchedulerStore {
             )?,
         )?;
         tx.commit()?;
+        self.persist_prompt_artifacts_after_commit(&task.task_id, &run.run_id, &input.prompt_text);
         Ok(run)
     }
 
@@ -730,12 +750,6 @@ impl SchedulerStore {
                 affinity_policy: TaskAffinityPolicy::PreferSameIdentity,
             },
         );
-        persist_run_prompt(
-            &self.base_root,
-            &task.task_id,
-            &run.run_id,
-            &latest_input.prompt_text,
-        )?;
         let retry_input = TaskRunInputRecord {
             run_id: run.run_id.clone(),
             prompt_text: latest_input.prompt_text,
@@ -765,7 +779,35 @@ impl SchedulerStore {
             )?,
         )?;
         tx.commit()?;
+        self.persist_prompt_artifacts_after_commit(
+            &task.task_id,
+            &run.run_id,
+            &retry_input.prompt_text,
+        );
         Ok(run)
+    }
+
+    fn persist_prompt_artifacts_after_commit(
+        &self,
+        task_id: &TaskId,
+        run_id: &TaskRunId,
+        prompt: &str,
+    ) {
+        if let Err(error) = persist_run_prompt(&self.base_root, task_id, run_id, prompt) {
+            if let Ok(event) = SchedulerEventRecord::new(
+                None,
+                Some(task_id.clone()),
+                Some(run_id.clone()),
+                "prompt_artifact_persist_failed",
+                format!("prompt artifact persistence failed for run {run_id}: {error}"),
+                json!({
+                    "run_id": run_id,
+                    "error": error.to_string(),
+                }),
+            ) {
+                let _ = self.append_event(&event);
+            }
+        }
     }
 
     pub fn list_tasks(&self, project: Option<&str>) -> Result<Vec<TaskRecord>> {
@@ -1161,12 +1203,24 @@ impl SchedulerStore {
         Ok(true)
     }
 
-    pub fn mark_worker_spawned(&mut self, run_id: &str, worker_pid: u32) -> Result<()> {
+    pub fn mark_worker_spawned(
+        &mut self,
+        run_id: &str,
+        worker_owner_id: &str,
+        worker_pid: u32,
+    ) -> Result<()> {
         let now = current_timestamp()?;
-        self.connection.execute(
-            "UPDATE task_runs SET worker_pid = ?2, run_attempt_no = run_attempt_no + 1, heartbeat_at = ?3 WHERE run_id = ?1 AND status = 'assigned'",
-            params![run_id, worker_pid, now],
+        let updated = self.connection.execute(
+            "UPDATE task_runs
+             SET worker_pid = ?3, run_attempt_no = run_attempt_no + 1, heartbeat_at = ?4
+             WHERE run_id = ?1 AND status = 'assigned' AND worker_owner_id = ?2",
+            params![run_id, worker_owner_id, worker_pid, now],
         )?;
+        if updated == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1179,18 +1233,35 @@ impl SchedulerStore {
     ) -> Result<TaskRunRecord> {
         let now = current_timestamp()?;
         let tx = self.connection.transaction()?;
-        tx.execute(
-            "UPDATE task_runs SET status = 'launching', worker_owner_id = ?2, worker_pid = ?3, heartbeat_at = ?4, heartbeat_expires_at = ?5
-             WHERE run_id = ?1 AND status IN ('assigned', 'launching')",
+        let updated = tx.execute(
+            "UPDATE task_runs
+             SET status = 'launching', worker_pid = ?3, heartbeat_at = ?4, heartbeat_expires_at = ?5
+             WHERE run_id = ?1 AND status IN ('assigned', 'launching') AND worker_owner_id = ?2",
             params![run_id, worker_owner_id, worker_pid, now, lease_expires_at],
         )?;
-        tx.execute(
+        if updated == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
+        let account_updates = tx.execute(
             "UPDATE account_leases SET heartbeat_at = ?3, expires_at = ?4, updated_at = ?3 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
         )?;
-        tx.execute(
+        let worktree_updates = tx.execute(
             "UPDATE worktree_leases SET heartbeat_at = ?3, expires_at = ?4 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
+        )?;
+        if account_updates == 0 || worktree_updates == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE account_runtime
+             SET state = 'launching', updated_at = ?2
+             WHERE identity_id = (SELECT assigned_identity_id FROM task_runs WHERE run_id = ?1)",
+            params![run_id, now],
         )?;
         append_scheduler_event_tx(
             &tx,
@@ -1227,20 +1298,30 @@ impl SchedulerStore {
     ) -> Result<()> {
         let now = current_timestamp()?;
         let tx = self.connection.transaction()?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE task_runs
              SET status = 'running', started_at = COALESCE(started_at, ?3), assigned_thread_id = ?4, last_turn_id = COALESCE(?5, last_turn_id), heartbeat_at = ?3, heartbeat_expires_at = ?6
-             WHERE run_id = ?1 AND worker_owner_id = ?2",
+             WHERE run_id = ?1 AND worker_owner_id = ?2 AND status IN ('assigned', 'launching', 'running')",
             params![run_id, worker_owner_id, now, thread_id, turn_id, lease_expires_at],
         )?;
-        tx.execute(
+        if updated == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
+        let account_updates = tx.execute(
             "UPDATE account_leases SET heartbeat_at = ?3, expires_at = ?4, updated_at = ?3 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
         )?;
-        tx.execute(
+        let worktree_updates = tx.execute(
             "UPDATE worktree_leases SET heartbeat_at = ?3, expires_at = ?4 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
         )?;
+        if account_updates == 0 || worktree_updates == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
         tx.execute(
             "UPDATE account_runtime SET state = 'running', updated_at = ?2 WHERE identity_id = (SELECT assigned_identity_id FROM task_runs WHERE run_id = ?1)",
             params![run_id, now],
@@ -1272,19 +1353,29 @@ impl SchedulerStore {
     ) -> Result<()> {
         let now = current_timestamp()?;
         let tx = self.connection.transaction()?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE task_runs SET heartbeat_at = ?3, heartbeat_expires_at = ?4, last_turn_id = COALESCE(?5, last_turn_id)
-             WHERE run_id = ?1 AND worker_owner_id = ?2",
+             WHERE run_id = ?1 AND worker_owner_id = ?2 AND status IN ('launching', 'running', 'handoff_pending')",
             params![run_id, worker_owner_id, now, lease_expires_at, turn_id],
         )?;
-        tx.execute(
+        if updated == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
+        let account_updates = tx.execute(
             "UPDATE account_leases SET heartbeat_at = ?3, expires_at = ?4, updated_at = ?3 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
         )?;
-        tx.execute(
+        let worktree_updates = tx.execute(
             "UPDATE worktree_leases SET heartbeat_at = ?3, expires_at = ?4 WHERE run_id = ?1 AND lease_owner_id = ?2",
             params![run_id, worker_owner_id, now, lease_expires_at],
         )?;
+        if account_updates == 0 || worktree_updates == 0 {
+            return Err(AppError::WorkerNotActive {
+                run_id: run_id.to_string(),
+            });
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1294,7 +1385,8 @@ impl SchedulerStore {
         let tx = self.connection.transaction()?;
         let run = tx
             .query_row(
-                "SELECT task_id, assigned_identity_id, assigned_worktree_id FROM task_runs WHERE run_id = ?1",
+                "SELECT task_id, assigned_identity_id, assigned_worktree_id, status
+                 FROM task_runs WHERE run_id = ?1",
                 params![run_id],
                 |row| {
                     Ok((
@@ -1303,6 +1395,13 @@ impl SchedulerStore {
                             .map(IdentityId::from_string),
                         row.get::<_, Option<String>>(2)?
                             .map(WorktreeId::from_string),
+                        TaskRunStatus::parse(&row.get::<_, String>(3)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
                     ))
                 },
             )
@@ -1310,9 +1409,14 @@ impl SchedulerStore {
             .ok_or_else(|| AppError::TaskRunNotFound {
                 run_id: run_id.to_string(),
             })?;
+        if run.3.is_terminal() {
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute(
             "UPDATE task_runs SET status = ?2, finished_at = ?3, exit_code = ?4, failure_kind = ?5, failure_message = ?6, assigned_thread_id = COALESCE(?7, assigned_thread_id), heartbeat_at = ?3, heartbeat_expires_at = NULL
-             WHERE run_id = ?1",
+             , worker_pid = NULL, worker_owner_id = NULL
+             WHERE run_id = ?1 AND status NOT IN ('completed', 'failed', 'timed_out', 'abandoned', 'canceled', 'orphaned')",
             params![
                 run_id,
                 completion.status.as_str(),
@@ -1374,6 +1478,20 @@ impl SchedulerStore {
             TaskRunStatus::Orphaned => TaskStatus::Orphaned,
             _ => TaskStatus::FailedTerminal,
         };
+        let current_task_status: TaskStatus = tx.query_row(
+            "SELECT status FROM tasks WHERE task_id = ?1",
+            params![run.0.as_str()],
+            |row| {
+                TaskStatus::parse(&row.get::<_, String>(0)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                })
+            },
+        )?;
+        let effective_task_status = if current_task_status == TaskStatus::Canceled {
+            TaskStatus::Canceled
+        } else {
+            task_status
+        };
         tx.execute(
             "UPDATE tasks
              SET status = ?2,
@@ -1386,7 +1504,7 @@ impl SchedulerStore {
              WHERE task_id = ?1",
             params![
                 run.0.as_str(),
-                task_status.as_str(),
+                effective_task_status.as_str(),
                 now,
                 completion.thread_id.as_deref(),
                 completion.checkpoint_id.as_deref(),
@@ -1475,49 +1593,316 @@ impl SchedulerStore {
 
     pub fn requeue_orphaned_run(&mut self, run_id: &str) -> Result<()> {
         let now = current_timestamp()?;
-        self.connection.execute(
-            "UPDATE task_runs SET status = 'pending_assignment', worker_pid = NULL, worker_owner_id = NULL, heartbeat_at = NULL, heartbeat_expires_at = NULL, failure_kind = NULL, failure_message = NULL WHERE run_id = ?1 AND status = 'orphaned'",
-            params![run_id],
-        )?;
-        self.connection.execute(
-            "UPDATE tasks SET status = 'queued', updated_at = ?2 WHERE task_id = (SELECT task_id FROM task_runs WHERE run_id = ?1)",
-            params![run_id, now],
-        )?;
-        self.append_event(&SchedulerEventRecord::new(
-            None,
-            None,
-            Some(TaskRunId::from_string(run_id)),
-            "run_requeued",
-            format!("orphaned run {run_id} requeued"),
-            json!({}),
-        )?)?;
-        Ok(())
-    }
-
-    pub fn cancel_task(&mut self, task_id: &str) -> Result<()> {
-        let now = current_timestamp()?;
         let tx = self.connection.transaction()?;
         tx.execute(
-            "UPDATE tasks SET status = 'canceled', updated_at = ?2 WHERE task_id = ?1",
-            params![task_id, now],
+            "UPDATE task_runs
+             SET status = 'pending_assignment',
+                 worker_pid = NULL,
+                 worker_owner_id = NULL,
+                 heartbeat_at = NULL,
+                 heartbeat_expires_at = NULL,
+                 failure_kind = NULL,
+                 failure_message = NULL
+             WHERE run_id = ?1 AND status = 'orphaned'",
+            params![run_id],
         )?;
         tx.execute(
-            "UPDATE task_runs SET status = CASE WHEN status = 'pending_assignment' THEN 'canceled' ELSE status END, finished_at = CASE WHEN status = 'pending_assignment' THEN ?2 ELSE finished_at END
-             WHERE task_id = ?1 AND status = 'pending_assignment'",
-            params![task_id, now],
+            "UPDATE tasks
+             SET status = 'queued', updated_at = ?2
+             WHERE task_id = (SELECT task_id FROM task_runs WHERE run_id = ?1)",
+            params![run_id, now],
         )?;
         append_scheduler_event_tx(
             &tx,
             &SchedulerEventRecord::new(
                 None,
-                Some(TaskId::from_string(task_id)),
                 None,
-                "task_canceled",
-                format!("task {task_id} canceled"),
+                Some(TaskRunId::from_string(run_id)),
+                "run_requeued",
+                format!("orphaned run {run_id} requeued"),
                 json!({}),
             )?,
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rollback_assignment_after_spawn_failure(
+        &mut self,
+        run_id: &str,
+        worker_owner_id: &str,
+        message: &str,
+    ) -> Result<bool> {
+        let now = current_timestamp()?;
+        let tx = self.connection.transaction()?;
+        let run = tx
+            .query_row(
+                "SELECT task_id, assigned_identity_id, assigned_worktree_id, status
+                 FROM task_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        TaskId::from_string(row.get::<_, String>(0)?),
+                        row.get::<_, Option<String>>(1)?
+                            .map(IdentityId::from_string),
+                        row.get::<_, Option<String>>(2)?
+                            .map(WorktreeId::from_string),
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, identity_id, worktree_id, status)) = run else {
+            return Ok(false);
+        };
+        if status != TaskRunStatus::Assigned.as_str() {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let updated = tx.execute(
+            "UPDATE task_runs
+             SET status = 'pending_assignment',
+                 assigned_identity_id = NULL,
+                 assigned_worktree_id = NULL,
+                 launch_mode = NULL,
+                 worker_pid = NULL,
+                 worker_owner_id = NULL,
+                 heartbeat_at = NULL,
+                 heartbeat_expires_at = NULL,
+                 failure_kind = NULL,
+                 failure_message = NULL
+             WHERE run_id = ?1 AND status = 'assigned' AND worker_owner_id = ?2",
+            params![run_id, worker_owner_id],
+        )?;
+        if updated == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM account_leases WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM worktree_leases WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        if let Some(identity_id) = identity_id.as_ref() {
+            let remaining_leases: i64 = tx.query_row(
+                "SELECT COUNT(1) FROM account_leases WHERE identity_id = ?1",
+                params![identity_id.as_str()],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE account_runtime
+                 SET state = CASE WHEN ?2 = 0 THEN 'free' ELSE 'reserved' END,
+                     active_count = ?2,
+                     active_run_id = CASE WHEN ?2 = 0 THEN NULL ELSE active_run_id END,
+                     last_failure_at = ?3,
+                     updated_at = ?3
+                 WHERE identity_id = ?1",
+                params![identity_id.as_str(), remaining_leases, now],
+            )?;
+        }
+        if let Some(worktree_id) = worktree_id.as_ref() {
+            tx.execute(
+                "UPDATE worktrees
+                 SET state = 'ready', updated_at = ?2, cleanup_after = ?3
+                 WHERE worktree_id = ?1",
+                params![worktree_id.as_str(), now, now + 60 * 60],
+            )?;
+        }
+        tx.execute(
+            "UPDATE tasks SET status = 'queued', updated_at = ?2 WHERE task_id = ?1",
+            params![task_id.as_str(), now],
+        )?;
+        append_scheduler_event_tx(
+            &tx,
+            &SchedulerEventRecord::new(
+                None,
+                Some(task_id),
+                Some(TaskRunId::from_string(run_id)),
+                "worker_spawn_failed",
+                format!("worker spawn failed for run {run_id}: {message}"),
+                json!({
+                    "run_id": run_id,
+                    "worker_owner_id": worker_owner_id,
+                    "message": message,
+                }),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn cancel_task(&mut self, task_id: &str) -> Result<CancelTaskOutcome> {
+        let now = current_timestamp()?;
+        let tx = self.connection.transaction()?;
+        let task = tx
+            .query_row(
+                "SELECT task_id FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |row| Ok(TaskId::from_string(row.get::<_, String>(0)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::TaskNotFound {
+                task_id: task_id.to_string(),
+            })?;
+        let active_runs = {
+            let mut statement = tx.prepare(
+                "SELECT run_id, worker_pid, assigned_identity_id, assigned_worktree_id
+                 FROM task_runs
+                 WHERE task_id = ?1
+                   AND status IN ('pending_assignment', 'assigned', 'launching', 'running', 'handoff_pending')",
+            )?;
+            let rows = statement.query_map(params![task_id], |row| {
+                Ok((
+                    TaskRunId::from_string(row.get::<_, String>(0)?),
+                    row.get::<_, Option<u32>>(1)?,
+                    row.get::<_, Option<String>>(2)?
+                        .map(IdentityId::from_string),
+                    row.get::<_, Option<String>>(3)?
+                        .map(WorktreeId::from_string),
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "UPDATE tasks SET status = 'canceled', updated_at = ?2 WHERE task_id = ?1",
+            params![task_id, now],
+        )?;
+        tx.execute(
+            "UPDATE task_runs
+             SET status = 'canceled',
+                 finished_at = COALESCE(finished_at, ?2),
+                 failure_kind = 'canceled',
+                 failure_message = 'task canceled',
+                 worker_pid = NULL,
+                 worker_owner_id = NULL,
+                 heartbeat_at = ?2,
+                 heartbeat_expires_at = NULL
+             WHERE task_id = ?1
+               AND status IN ('pending_assignment', 'assigned', 'launching', 'running', 'handoff_pending')",
+            params![task_id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM account_leases
+             WHERE run_id IN (
+                SELECT run_id FROM task_runs WHERE task_id = ?1 AND status = 'canceled'
+             )",
+            params![task_id],
+        )?;
+        tx.execute(
+            "DELETE FROM worktree_leases
+             WHERE run_id IN (
+                SELECT run_id FROM task_runs WHERE task_id = ?1 AND status = 'canceled'
+             )",
+            params![task_id],
+        )?;
+        for (_, _, identity_id, worktree_id) in &active_runs {
+            if let Some(identity_id) = identity_id.as_ref() {
+                let remaining_leases: i64 = tx.query_row(
+                    "SELECT COUNT(1) FROM account_leases WHERE identity_id = ?1",
+                    params![identity_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE account_runtime
+                     SET state = CASE WHEN ?2 = 0 THEN 'free' ELSE 'reserved' END,
+                         active_count = ?2,
+                         active_run_id = CASE WHEN ?2 = 0 THEN NULL ELSE active_run_id END,
+                         last_failure_at = ?3,
+                         updated_at = ?3
+                     WHERE identity_id = ?1",
+                    params![identity_id.as_str(), remaining_leases, now],
+                )?;
+            }
+            if let Some(worktree_id) = worktree_id.as_ref() {
+                tx.execute(
+                    "UPDATE worktrees
+                     SET state = 'ready', updated_at = ?2, cleanup_after = ?3
+                     WHERE worktree_id = ?1",
+                    params![worktree_id.as_str(), now, now + 60 * 60],
+                )?;
+            }
+        }
+        append_scheduler_event_tx(
+            &tx,
+            &SchedulerEventRecord::new(
+                None,
+                Some(task.clone()),
+                None,
+                "task_canceled",
+                format!("task {task_id} canceled"),
+                json!({
+                    "interrupted_runs": active_runs
+                        .iter()
+                        .map(|(run_id, worker_pid, _, _)| json!({
+                            "run_id": run_id,
+                            "worker_pid": worker_pid,
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(CancelTaskOutcome {
+            task_id: task,
+            interrupted_runs: active_runs
+                .into_iter()
+                .map(|(run_id, worker_pid, _, _)| CanceledRunRecord { run_id, worker_pid })
+                .collect(),
+        })
+    }
+
+    pub fn reserve_worktree_for_gc(
+        &mut self,
+        worktree_id: &WorktreeId,
+        now: i64,
+    ) -> Result<Option<WorktreeRecord>> {
+        let tx = self.connection.transaction()?;
+        let worktree = tx
+            .query_row(
+                "SELECT worktree_id, project_id, task_id, path, execution_mode, state, last_run_id, last_used_at, created_at, updated_at, cleanup_after, reusable
+                 FROM worktrees
+                 WHERE worktree_id = ?1
+                   AND cleanup_after IS NOT NULL
+                   AND cleanup_after <= ?2
+                   AND worktree_id NOT IN (SELECT worktree_id FROM worktree_leases)",
+                params![worktree_id.as_str(), now],
+                worktree_from_row,
+            )
+            .optional()?;
+        let Some(worktree) = worktree else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        let updated = tx.execute(
+            "UPDATE worktrees
+             SET state = 'cleaning', updated_at = ?2
+             WHERE worktree_id = ?1
+               AND cleanup_after IS NOT NULL
+               AND cleanup_after <= ?2
+               AND worktree_id NOT IN (SELECT worktree_id FROM worktree_leases)",
+            params![worktree_id.as_str(), now],
+        )?;
+        if updated == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(worktree))
+    }
+
+    pub fn release_worktree_gc_reservation(
+        &mut self,
+        worktree_id: &WorktreeId,
+        state: WorktreeState,
+    ) -> Result<()> {
+        let now = current_timestamp()?;
+        self.connection.execute(
+            "UPDATE worktrees SET state = ?2, updated_at = ?3 WHERE worktree_id = ?1 AND state = 'cleaning'",
+            params![worktree_id.as_str(), state.as_str(), now],
+        )?;
         Ok(())
     }
 
@@ -1605,6 +1990,7 @@ impl SchedulerStore {
         tx.execute(
             "DELETE FROM worktrees
              WHERE worktree_id = ?1
+               AND state = 'cleaning'
                AND worktree_id NOT IN (SELECT worktree_id FROM worktree_leases)",
             params![worktree.worktree_id.as_str()],
         )?;
@@ -1665,7 +2051,7 @@ impl SchedulerStore {
         let mut statement = self.connection.prepare(
             "SELECT worktree_id, project_id, task_id, path, execution_mode, state, last_run_id, last_used_at, created_at, updated_at, cleanup_after, reusable
              FROM worktrees
-             WHERE task_id = ?1 AND reusable = 1
+             WHERE task_id = ?1 AND reusable = 1 AND state = 'ready'
              ORDER BY updated_at DESC LIMIT 1",
         )?;
         statement
@@ -2121,12 +2507,14 @@ fn process_is_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{ProjectSubmitRequest, SchedulerStore, TaskSubmitRequest};
     use crate::domain::identity::IdentityId;
+    use crate::error::AppError;
     use crate::task_orchestration::config::SchedulerSettings;
     use crate::task_orchestration::domain::{
         CleanupPolicy, DispatchDecisionId, DispatchDecisionRecord, LineageMode,
@@ -2358,5 +2746,275 @@ mod tests {
         assert_eq!(run.status, TaskRunStatus::PendingAssignment);
         let task = store.get_task(snapshot.task.task_id.as_str()).unwrap();
         assert_eq!(task.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn keeps_leases_alive_with_stable_worker_owner() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let (project, snapshot) = create_project_and_task(&mut store, temp.path());
+        let run = snapshot.runs[0].clone();
+        let worktree = make_worktree(&project, &snapshot.task.task_id, temp.path().join("wt"));
+        let worker_owner_id = "worker-lease-1";
+
+        claim_run(
+            &mut store,
+            &project,
+            &run,
+            &snapshot.task.task_id,
+            worktree,
+            worker_owner_id,
+        );
+        store
+            .mark_worker_spawned(run.run_id.as_str(), worker_owner_id, 4242)
+            .unwrap();
+        store
+            .start_run_launching(run.run_id.as_str(), worker_owner_id, 4242, 150)
+            .unwrap();
+        store
+            .mark_run_running(
+                run.run_id.as_str(),
+                worker_owner_id,
+                "thread-1",
+                Some("turn-1"),
+                200,
+            )
+            .unwrap();
+        store
+            .heartbeat_run(run.run_id.as_str(), worker_owner_id, Some("turn-1"), 250)
+            .unwrap();
+
+        let account_leases = store.active_account_leases().unwrap();
+        assert_eq!(account_leases.len(), 1);
+        assert_eq!(account_leases[0].lease_owner_id, worker_owner_id);
+        assert_eq!(account_leases[0].expires_at, 250);
+
+        let worktree_leases = store.worktree_leases().unwrap();
+        assert_eq!(worktree_leases.len(), 1);
+        assert_eq!(worktree_leases[0].lease_owner_id, worker_owner_id);
+        assert_eq!(worktree_leases[0].expires_at, 250);
+    }
+
+    #[test]
+    fn canceling_running_task_is_terminal_and_releases_leases() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let (project, snapshot) = create_project_and_task(&mut store, temp.path());
+        let run = snapshot.runs[0].clone();
+        let worktree = make_worktree(&project, &snapshot.task.task_id, temp.path().join("wt"));
+        let worker_owner_id = "worker-lease-2";
+
+        claim_run(
+            &mut store,
+            &project,
+            &run,
+            &snapshot.task.task_id,
+            worktree,
+            worker_owner_id,
+        );
+        store
+            .mark_worker_spawned(run.run_id.as_str(), worker_owner_id, 9898)
+            .unwrap();
+        store
+            .start_run_launching(run.run_id.as_str(), worker_owner_id, 9898, 150)
+            .unwrap();
+        store
+            .mark_run_running(
+                run.run_id.as_str(),
+                worker_owner_id,
+                "thread-1",
+                Some("turn-1"),
+                200,
+            )
+            .unwrap();
+
+        let outcome = store.cancel_task(snapshot.task.task_id.as_str()).unwrap();
+        assert_eq!(outcome.interrupted_runs.len(), 1);
+        assert_eq!(outcome.interrupted_runs[0].worker_pid, Some(9898));
+        assert!(store.active_account_leases().unwrap().is_empty());
+        assert!(store.worktree_leases().unwrap().is_empty());
+
+        store
+            .finish_run(
+                run.run_id.as_str(),
+                super::RunCompletion {
+                    status: TaskRunStatus::Completed,
+                    exit_code: Some(0),
+                    failure_kind: None,
+                    failure_message: None,
+                    thread_id: Some("thread-1".to_string()),
+                    checkpoint_id: None,
+                    last_identity_id: Some(IdentityId::from_string("identity-1")),
+                },
+            )
+            .unwrap();
+
+        let canceled_run = store.get_run(run.run_id.as_str()).unwrap();
+        assert_eq!(canceled_run.status, TaskRunStatus::Canceled);
+        let task = store.get_task(snapshot.task.task_id.as_str()).unwrap();
+        assert_eq!(task.status, TaskStatus::Canceled);
+    }
+
+    #[test]
+    fn spawn_failure_rollback_requeues_assignment_and_releases_leases() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let (project, snapshot) = create_project_and_task(&mut store, temp.path());
+        let run = snapshot.runs[0].clone();
+        let worktree = make_worktree(&project, &snapshot.task.task_id, temp.path().join("wt"));
+        let worker_owner_id = "worker-lease-3";
+
+        claim_run(
+            &mut store,
+            &project,
+            &run,
+            &snapshot.task.task_id,
+            worktree,
+            worker_owner_id,
+        );
+        assert!(store
+            .rollback_assignment_after_spawn_failure(
+                run.run_id.as_str(),
+                worker_owner_id,
+                "spawn failed"
+            )
+            .unwrap());
+
+        let run = store.get_run(run.run_id.as_str()).unwrap();
+        assert_eq!(run.status, TaskRunStatus::PendingAssignment);
+        assert!(run.assigned_identity_id.is_none());
+        assert!(run.assigned_worktree_id.is_none());
+        assert!(store.active_account_leases().unwrap().is_empty());
+        assert!(store.worktree_leases().unwrap().is_empty());
+        let task = store.get_task(snapshot.task.task_id.as_str()).unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn scheduler_lock_requires_expiry_before_takeover() {
+        let temp = tempdir().unwrap();
+        let mut store_a = SchedulerStore::open(temp.path()).unwrap();
+        let mut store_b = SchedulerStore::open(temp.path()).unwrap();
+
+        store_a
+            .acquire_scheduler_lock("scheduler-a", Duration::from_secs(60))
+            .unwrap();
+        let error = store_b
+            .acquire_scheduler_lock("scheduler-b", Duration::from_secs(60))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::SchedulerAlreadyRunning { owner_id } if owner_id == "scheduler-a"
+        ));
+
+        store_a
+            .connection
+            .execute(
+                "UPDATE scheduler_process_lock SET expires_at = 0 WHERE lock_name = 'dispatcher'",
+                [],
+            )
+            .unwrap();
+
+        store_b
+            .acquire_scheduler_lock("scheduler-b", Duration::from_secs(60))
+            .unwrap();
+    }
+
+    fn create_project_and_task(
+        store: &mut SchedulerStore,
+        base_root: &std::path::Path,
+    ) -> (
+        crate::task_orchestration::domain::ProjectRecord,
+        crate::task_orchestration::domain::TaskLineageSnapshot,
+    ) {
+        let project = store
+            .create_project(ProjectSubmitRequest {
+                name: "demo".to_string(),
+                repo_root: base_root.join("repo"),
+                execution_mode: ProjectExecutionMode::CopyWorkspace,
+                default_codex_args: Vec::new(),
+                default_model_or_profile: None,
+                env_allowlist: Vec::new(),
+                cleanup_policy: CleanupPolicy::default(),
+            })
+            .unwrap();
+        let snapshot = store
+            .submit_task(TaskSubmitRequest {
+                project: project.name.clone(),
+                title: "Task".to_string(),
+                prompt_text: "hello".to_string(),
+                prompt_file_path: None,
+                priority: 1,
+                labels: Vec::new(),
+                created_by: "test".to_string(),
+                max_runtime_secs: None,
+                queue_if_busy: true,
+                allow_oversubscribe: false,
+                affinity_policy: TaskAffinityPolicy::Spread,
+            })
+            .unwrap();
+        (project, snapshot)
+    }
+
+    fn make_worktree(
+        project: &crate::task_orchestration::domain::ProjectRecord,
+        task_id: &crate::task_orchestration::domain::TaskId,
+        path: std::path::PathBuf,
+    ) -> WorktreeRecord {
+        WorktreeRecord {
+            worktree_id: WorktreeId::from_string(format!("worktree-{}", path.display())),
+            project_id: project.project_id.clone(),
+            task_id: task_id.clone(),
+            path,
+            execution_mode: ProjectExecutionMode::CopyWorkspace,
+            state: WorktreeState::Ready,
+            last_run_id: None,
+            last_used_at: 1,
+            created_at: 1,
+            updated_at: 1,
+            cleanup_after: None,
+            reusable: true,
+        }
+    }
+
+    fn claim_run(
+        store: &mut SchedulerStore,
+        project: &crate::task_orchestration::domain::ProjectRecord,
+        run: &crate::task_orchestration::domain::TaskRunRecord,
+        task_id: &crate::task_orchestration::domain::TaskId,
+        worktree: WorktreeRecord,
+        worker_owner_id: &str,
+    ) {
+        let decision = DispatchDecisionRecord {
+            decision_id: DispatchDecisionId::new(),
+            run_id: run.run_id.clone(),
+            decision_kind: crate::task_orchestration::domain::DecisionKind::Dispatch,
+            selected_identity_id: Some(IdentityId::from_string("identity-1")),
+            selected_worktree_id: Some(worktree.worktree_id.clone()),
+            lineage_mode: LineageMode::NewThread,
+            reason: "test assignment".to_string(),
+            candidates: Vec::new(),
+            policy_snapshot_json: json!({}),
+            created_at: 1,
+        };
+        let claimed = store
+            .claim_assignment(
+                &super::AssignmentClaim {
+                    run_id: run.run_id.clone(),
+                    task_id: task_id.clone(),
+                    project_id: project.project_id.clone(),
+                    identity_id: IdentityId::from_string("identity-1"),
+                    worktree,
+                    worker_owner_id: worker_owner_id.to_string(),
+                    launch_mode: crate::task_orchestration::domain::LaunchMode::NewThread,
+                    lineage_mode: LineageMode::NewThread,
+                    reason: "test assignment".to_string(),
+                    decision,
+                    lease_expires_at: 100,
+                },
+                &SchedulerSettings::default(),
+            )
+            .unwrap();
+        assert!(claimed);
     }
 }

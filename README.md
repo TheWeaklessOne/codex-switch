@@ -150,10 +150,13 @@ codex-switch scheduler tick --once
 codex-switch scheduler health
 codex-switch scheduler run
 codex-switch scheduler gc
+codex-switch scheduler reset-state
 codex-switch scheduler disable
 ```
 
 The scheduler rollout gate `scheduler_v1` is disabled by default. Use `codex-switch scheduler enable` before submitting or retrying scheduler-managed tasks. Read-only inspection commands remain available when the rollout gate is off.
+
+`codex-switch tasks cancel <task-id>` is a hard cancel for scheduler-managed work: it durably marks active runs as canceled, releases account/worktree leases, and then best-effort interrupts the worker process group. Use `codex-switch scheduler reset-state` only as an operator recovery step when you intentionally want to clear the task orchestration bounded context.
 
 ## Runtime Layout
 

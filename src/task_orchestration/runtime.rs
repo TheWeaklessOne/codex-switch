@@ -51,12 +51,15 @@ impl TaskRuntimeWorker {
         }
     }
 
-    pub fn run(&self, run_id: &str) -> Result<()> {
+    pub fn run(&self, run_id: &str, worker_owner_id: &str) -> Result<()> {
         let pid = std::process::id();
-        let owner_id = format!("worker-{pid}-{run_id}");
         let mut store = SchedulerStore::open(&self.base_root)?;
         let lease_expires_at = lease_expiry(&self.settings)?;
-        let run = store.start_run_launching(run_id, &owner_id, pid, lease_expires_at)?;
+        let run = match store.start_run_launching(run_id, worker_owner_id, pid, lease_expires_at) {
+            Ok(run) => run,
+            Err(AppError::WorkerNotActive { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let (project, task, _, input) = store.run_context(run_id)?;
         let worktree =
             store.get_worktree(run.assigned_worktree_id.as_ref().ok_or_else(|| {
@@ -209,48 +212,46 @@ impl TaskRuntimeWorker {
             thread_id.as_deref().expect("thread id"),
             &runtime_setup.prompt_text,
         )?;
-        store.mark_run_running(
+        match store.mark_run_running(
             run_id,
-            &owner_id,
+            worker_owner_id,
             thread_id.as_deref().expect("thread id"),
             Some(&turn_id),
             lease_expiry(&self.settings)?,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(AppError::WorkerNotActive { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let deadline_at = compute_deadline_at(run.started_at, run.max_runtime_secs)?;
         let artifact_path =
             task_artifact_events_path(&self.base_root, task.task_id.as_str(), run.run_id.as_str());
-        let completed = self.wait_for_turn(
+        let outcome = self.wait_for_turn(
             &mut store,
             &mut session,
-            run_id,
-            &owner_id,
-            &artifact_path,
-            &turn_id,
+            WaitForTurnContext {
+                run_id,
+                worker_owner_id,
+                artifact_path: &artifact_path,
+                turn_id: &turn_id,
+                deadline_at,
+            },
         )?;
-        let final_snapshot =
-            read_thread_snapshot(&mut session, thread_id.as_deref().expect("thread id"))?;
-        persist_thread_snapshot(
-            &self.base_root,
-            task.task_id.as_str(),
-            run.run_id.as_str(),
-            &final_snapshot,
-        )?;
-        if let Some((handoff_service, lease_token)) = runtime_setup.handoff_acceptance {
-            let _ = handoff_service.confirm_handoff(
-                thread_id.as_deref().expect("thread id"),
-                &identity.display_name,
-                &lease_token,
-                Some(&turn_id),
-            );
-        }
-
-        let (status, failure_kind, failure_message) = if completed {
-            (TaskRunStatus::Completed, None, None)
-        } else {
-            (
+        let (status, failure_kind, failure_message, preserve_identity) = match outcome {
+            RunLoopOutcome::Completed => (TaskRunStatus::Completed, None, None, true),
+            RunLoopOutcome::Failed(message) => (
                 TaskRunStatus::Failed,
                 Some(FailureKind::Runtime),
-                Some("turn completed without a terminal completion notification".to_string()),
-            )
+                Some(message),
+                true,
+            ),
+            RunLoopOutcome::TimedOut(message) => (
+                TaskRunStatus::TimedOut,
+                Some(FailureKind::Timeout),
+                Some(message),
+                true,
+            ),
+            RunLoopOutcome::Canceled => return Ok(()),
         };
         store.finish_run(
             run_id,
@@ -259,28 +260,113 @@ impl TaskRuntimeWorker {
                 exit_code: Some(0),
                 failure_kind,
                 failure_message,
-                thread_id,
+                thread_id: thread_id.clone(),
                 checkpoint_id,
-                last_identity_id: Some(identity.id.clone()),
+                last_identity_id: preserve_identity.then_some(identity.id.clone()),
             },
         )?;
+        self.persist_post_finish_artifacts(
+            &mut store,
+            &mut session,
+            PostFinishArtifacts {
+                task_id: &task.task_id,
+                run_id: &run.run_id,
+                thread_id: thread_id.as_deref(),
+                handoff_acceptance: runtime_setup.handoff_acceptance.as_ref(),
+                identity: &identity,
+                turn_id: &turn_id,
+            },
+        );
         store.update_task_preferred_identity(&task.task_id, &identity.id)?;
         Ok(())
+    }
+
+    fn persist_post_finish_artifacts(
+        &self,
+        store: &mut SchedulerStore,
+        session: &mut AppServerSession,
+        context: PostFinishArtifacts<'_>,
+    ) {
+        let Some(thread_id) = context.thread_id else {
+            return;
+        };
+        if let Err(error) = read_thread_snapshot(session, thread_id).and_then(|snapshot| {
+            persist_thread_snapshot(
+                &self.base_root,
+                context.task_id.as_str(),
+                context.run_id.as_str(),
+                &snapshot,
+            )
+        }) {
+            self.append_runtime_warning_event(
+                store,
+                context.task_id,
+                context.run_id,
+                "post_finish_snapshot_failed",
+                format!(
+                    "post-finish snapshot persistence failed for run {}: {error}",
+                    context.run_id
+                ),
+            );
+        }
+        if let Some((handoff_service, lease_token)) = context.handoff_acceptance {
+            if let Err(error) = handoff_service.confirm_handoff(
+                thread_id,
+                &context.identity.display_name,
+                lease_token,
+                Some(context.turn_id),
+            ) {
+                self.append_runtime_warning_event(
+                    store,
+                    context.task_id,
+                    context.run_id,
+                    "post_finish_handoff_confirm_failed",
+                    format!(
+                        "handoff confirmation failed for run {}: {error}",
+                        context.run_id
+                    ),
+                );
+            }
+        }
+    }
+
+    fn append_runtime_warning_event(
+        &self,
+        store: &SchedulerStore,
+        task_id: &crate::task_orchestration::domain::TaskId,
+        run_id: &crate::task_orchestration::domain::TaskRunId,
+        event_kind: &str,
+        message: String,
+    ) {
+        if let Ok(event) = crate::task_orchestration::domain::SchedulerEventRecord::new(
+            None,
+            Some(task_id.clone()),
+            Some(run_id.clone()),
+            event_kind,
+            message,
+            json!({}),
+        ) {
+            let _ = store.append_event(&event);
+        }
     }
 
     fn wait_for_turn(
         &self,
         store: &mut SchedulerStore,
         session: &mut AppServerSession,
-        run_id: &str,
-        owner_id: &str,
-        artifact_path: &Path,
-        turn_id: &str,
-    ) -> Result<bool> {
+        context: WaitForTurnContext<'_>,
+    ) -> Result<RunLoopOutcome> {
         loop {
+            if let Some(deadline_at) = context.deadline_at {
+                if current_timestamp()? >= deadline_at {
+                    return Ok(RunLoopOutcome::TimedOut(format!(
+                        "run exceeded max_runtime_secs deadline at {deadline_at}"
+                    )));
+                }
+            }
             let lease_expires_at = lease_expiry(&self.settings)?;
             if let Some(message) = session.next_message(self.settings.worker_heartbeat_interval)? {
-                append_jsonl(artifact_path, &message)?;
+                append_jsonl(context.artifact_path, &message)?;
                 if let Some(method) = message.get("method").and_then(Value::as_str) {
                     match method {
                         "turn/completed" => {
@@ -289,8 +375,8 @@ impl TaskRuntimeWorker {
                                 .and_then(|value| value.get("turn"))
                                 .and_then(|value| value.get("id"))
                                 .and_then(Value::as_str);
-                            if notification_turn_id == Some(turn_id) {
-                                return Ok(true);
+                            if notification_turn_id == Some(context.turn_id) {
+                                return Ok(RunLoopOutcome::Completed);
                             }
                         }
                         "error" => {
@@ -299,29 +385,22 @@ impl TaskRuntimeWorker {
                                 .and_then(|value| value.get("message"))
                                 .and_then(Value::as_str)
                                 .unwrap_or("runtime error");
-                            store.finish_run(
-                                run_id,
-                                RunCompletion {
-                                    status: TaskRunStatus::Failed,
-                                    exit_code: None,
-                                    failure_kind: Some(FailureKind::Runtime),
-                                    failure_message: Some(error_message.to_string()),
-                                    thread_id: None,
-                                    checkpoint_id: None,
-                                    last_identity_id: None,
-                                },
-                            )?;
-                            return Err(AppError::RpcServer {
-                                method: "turn/start".to_string(),
-                                code: -32000,
-                                message: error_message.to_string(),
-                            });
+                            return Ok(RunLoopOutcome::Failed(error_message.to_string()));
                         }
                         _ => {}
                     }
                 }
             }
-            store.heartbeat_run(run_id, owner_id, Some(turn_id), lease_expires_at)?;
+            match store.heartbeat_run(
+                context.run_id,
+                context.worker_owner_id,
+                Some(context.turn_id),
+                lease_expires_at,
+            ) {
+                Ok(()) => {}
+                Err(AppError::WorkerNotActive { .. }) => return Ok(RunLoopOutcome::Canceled),
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -340,6 +419,34 @@ struct RuntimeSetup {
 enum SessionKind {
     NewThread,
     ResumeThread(String),
+}
+
+#[derive(Debug, Clone)]
+enum RunLoopOutcome {
+    Completed,
+    Failed(String),
+    TimedOut(String),
+    Canceled,
+}
+
+struct WaitForTurnContext<'a> {
+    run_id: &'a str,
+    worker_owner_id: &'a str,
+    artifact_path: &'a Path,
+    turn_id: &'a str,
+    deadline_at: Option<i64>,
+}
+
+struct PostFinishArtifacts<'a> {
+    task_id: &'a crate::task_orchestration::domain::TaskId,
+    run_id: &'a crate::task_orchestration::domain::TaskRunId,
+    thread_id: Option<&'a str>,
+    handoff_acceptance: Option<&'a (
+        HandoffService<JsonRegistryStore, CodexAppServerVerifier>,
+        String,
+    )>,
+    identity: &'a CodexIdentity,
+    turn_id: &'a str,
 }
 
 fn resolve_identity(base_root: &Path, identity_id: Option<&IdentityId>) -> Result<CodexIdentity> {
@@ -486,6 +593,18 @@ fn lease_expiry(settings: &SchedulerSettings) -> Result<i64> {
     Ok(current_timestamp()? + settings.worker_lease_ttl.as_secs() as i64)
 }
 
+fn compute_deadline_at(
+    started_at: Option<i64>,
+    max_runtime_secs: Option<i64>,
+) -> Result<Option<i64>> {
+    match max_runtime_secs {
+        Some(max_runtime_secs) => Ok(Some(
+            started_at.unwrap_or(current_timestamp()?) + max_runtime_secs.max(0),
+        )),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -493,7 +612,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::append_jsonl;
+    use super::{append_jsonl, compute_deadline_at};
 
     #[test]
     fn appends_jsonl_artifacts() {
@@ -504,5 +623,10 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("\"turn/started\""));
         assert!(content.contains("\"turn/completed\""));
+    }
+
+    #[test]
+    fn computes_deadline_from_started_at_when_present() {
+        assert_eq!(compute_deadline_at(Some(100), Some(30)).unwrap(), Some(130));
     }
 }

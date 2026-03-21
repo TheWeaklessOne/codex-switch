@@ -190,6 +190,63 @@ fn rejects_task_submission_until_scheduler_rollout_is_enabled() {
         ));
 }
 
+#[test]
+fn reset_state_clears_scheduler_bounded_context() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "projects",
+            "add",
+            "--name",
+            "demo",
+            "--repo-root",
+            &repo_root.to_string_lossy(),
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success();
+
+    enable_scheduler(&base_root_string);
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "tasks",
+            "submit",
+            "--project",
+            "demo",
+            "--title",
+            "Reset me",
+            "--prompt",
+            "temporary",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["scheduler", "reset-state", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scheduler state reset"));
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["projects", "list", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no projects registered"));
+}
+
 fn enable_scheduler(base_root: &str) {
     Command::cargo_bin("codex-switch")
         .unwrap()
