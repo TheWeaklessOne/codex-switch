@@ -1,11 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::domain::identity::IdentityId;
 use crate::error::{AppError, Result};
-use crate::storage::paths::{default_base_root, resolve_path, task_artifact_events_path};
+use crate::storage::paths::{
+    canonicalize_location, default_base_root, resolve_path, task_artifact_events_path,
+};
 use crate::task_orchestration::{
     CleanupPolicy, ProjectExecutionMode, ProjectSubmitRequest, SchedulerDaemon, SchedulerSettings,
     SchedulerStore, TaskAffinityPolicy, TaskFollowUpRequest, TaskRetryRequest, TaskRuntimeWorker,
@@ -62,11 +65,30 @@ pub struct TasksCommand {
     pub command: TasksSubcommand,
 }
 
+#[derive(Debug, Args)]
+pub struct JobsCommand {
+    #[command(subcommand)]
+    pub command: JobsSubcommand,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TasksSubcommand {
     Submit(SubmitTaskCommand),
     FollowUp(FollowUpTaskCommand),
     List(ListTasksCommand),
+    Status(TaskIdCommand),
+    Show(TaskIdCommand),
+    Logs(TaskIdCommand),
+    Explain(TaskIdCommand),
+    Cancel(TaskIdCommand),
+    Retry(TaskIdCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsSubcommand {
+    Run(RunJobCommand),
+    FollowUp(FollowUpTaskCommand),
+    List(ListJobsCommand),
     Status(TaskIdCommand),
     Show(TaskIdCommand),
     Logs(TaskIdCommand),
@@ -104,6 +126,34 @@ pub struct SubmitTaskCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct RunJobCommand {
+    #[arg(long)]
+    pub title: String,
+    #[arg(long)]
+    pub prompt: Option<String>,
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    pub priority: i64,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long)]
+    pub max_runtime: Option<i64>,
+    #[arg(long, default_value_t = true)]
+    pub queue_if_busy: bool,
+    #[arg(long, default_value_t = false)]
+    pub allow_oversubscribe: bool,
+    #[arg(long, value_enum, default_value_t = AffinityArg::Spread)]
+    pub affinity: AffinityArg,
+    #[arg(long)]
+    pub created_by: Option<String>,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub base_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct FollowUpTaskCommand {
     pub task_id: String,
     #[arg(long)]
@@ -122,6 +172,14 @@ pub struct FollowUpTaskCommand {
 pub struct ListTasksCommand {
     #[arg(long)]
     pub project: Option<String>,
+    #[arg(long)]
+    pub base_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ListJobsCommand {
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
     #[arg(long)]
     pub base_root: Option<PathBuf>,
 }
@@ -308,6 +366,90 @@ pub fn run_projects(command: ProjectsCommand) -> Result<()> {
     }
 }
 
+pub fn run_jobs(command: JobsCommand) -> Result<()> {
+    match command.command {
+        JobsSubcommand::Run(command) => {
+            let base_root = resolve_base_root(command.base_root.as_deref())?;
+            require_scheduler_rollout_enabled(&base_root, "jobs run")?;
+            let prompt_text =
+                resolve_prompt(command.prompt.as_deref(), command.prompt_file.as_deref())?;
+            let workspace = resolve_workspace_context(command.workspace.as_deref())?;
+            let mut store = SchedulerStore::open(&base_root)?;
+            let project = store.resolve_or_create_workspace_project(
+                &workspace.repo_root,
+                workspace.execution_mode,
+            )?;
+            let snapshot = store.submit_task(TaskSubmitRequest {
+                project: project.project_id.to_string(),
+                title: command.title,
+                prompt_text,
+                prompt_file_path: command
+                    .prompt_file
+                    .as_deref()
+                    .map(resolve_path)
+                    .transpose()?,
+                priority: command.priority,
+                labels: command.labels,
+                created_by: command.created_by.unwrap_or_else(default_created_by),
+                max_runtime_secs: command.max_runtime,
+                queue_if_busy: command.queue_if_busy,
+                allow_oversubscribe: command.allow_oversubscribe,
+                affinity_policy: command.affinity.into(),
+            })?;
+            println!("job submitted: {}", snapshot.task.title);
+            println!("workspace root: {}", workspace.repo_root.display());
+            println!("workspace mode: {}", workspace.execution_mode);
+            println!("project id: {}", project.project_id);
+            println!("task id: {}", snapshot.task.task_id);
+            println!("run id: {}", snapshot.runs[0].run_id);
+            Ok(())
+        }
+        JobsSubcommand::FollowUp(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::FollowUp(command),
+        }),
+        JobsSubcommand::List(command) => {
+            let base_root = resolve_base_root(command.base_root.as_deref())?;
+            let workspace = resolve_workspace_context(command.workspace.as_deref())?;
+            let store = SchedulerStore::open(&base_root)?;
+            let matches = store.projects_for_repo_root(&workspace.repo_root)?;
+            match matches.len() {
+                0 => {
+                    println!("no jobs found");
+                    Ok(())
+                }
+                1 => run_tasks(TasksCommand {
+                    command: TasksSubcommand::List(ListTasksCommand {
+                        project: Some(matches[0].project_id.to_string()),
+                        base_root: Some(base_root),
+                    }),
+                }),
+                _ => Err(AppError::WorkspaceProjectAmbiguous {
+                    workspace_root: workspace.repo_root,
+                    projects: matches.into_iter().map(|project| project.name).collect(),
+                }),
+            }
+        }
+        JobsSubcommand::Status(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Status(command),
+        }),
+        JobsSubcommand::Show(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Show(command),
+        }),
+        JobsSubcommand::Logs(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Logs(command),
+        }),
+        JobsSubcommand::Explain(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Explain(command),
+        }),
+        JobsSubcommand::Cancel(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Cancel(command),
+        }),
+        JobsSubcommand::Retry(command) => run_tasks(TasksCommand {
+            command: TasksSubcommand::Retry(command),
+        }),
+    }
+}
+
 pub fn run_tasks(command: TasksCommand) -> Result<()> {
     match command.command {
         TasksSubcommand::Submit(command) => {
@@ -469,10 +611,20 @@ pub fn run_tasks(command: TasksCommand) -> Result<()> {
             let base_root = resolve_base_root(command.base_root.as_deref())?;
             let mut store = SchedulerStore::open(&base_root)?;
             let outcome = store.cancel_task(&command.task_id)?;
-            let interrupted = interrupt_task_runs(&outcome);
+            let interrupt_outcome = interrupt_task_runs(&outcome);
+            store.schedule_canceled_worktree_cleanup(
+                &interrupt_outcome.cleanup_worktree_ids,
+                SchedulerSettings::default().failed_worktree_ttl,
+            )?;
             println!("task canceled: {}", command.task_id);
-            if interrupted > 0 {
-                println!("interrupted runs: {interrupted}");
+            if interrupt_outcome.interrupted_count > 0 {
+                println!("interrupted runs: {}", interrupt_outcome.interrupted_count);
+            }
+            if !interrupt_outcome.failed_run_ids.is_empty() {
+                println!(
+                    "cleanup scheduled after quarantine for {} runs without confirmed worker interruption",
+                    interrupt_outcome.failed_run_ids.len()
+                );
             }
             Ok(())
         }
@@ -597,7 +749,7 @@ pub fn run_scheduler(command: SchedulerCommand) -> Result<()> {
         }
         SchedulerSubcommand::ResetState(command) => {
             let base_root = resolve_base_root(command.base_root.as_deref())?;
-            SchedulerStore::reset_state(&base_root)?;
+            SchedulerStore::reset_state(&base_root, &SchedulerSettings::default())?;
             let _ = SchedulerStore::open(&base_root)?;
             println!("scheduler state reset: {}", base_root.display());
             Ok(())
@@ -638,13 +790,40 @@ pub fn run_scheduler(command: SchedulerCommand) -> Result<()> {
     }
 }
 
-fn interrupt_task_runs(outcome: &crate::task_orchestration::store::CancelTaskOutcome) -> usize {
-    outcome
-        .interrupted_runs
-        .iter()
-        .filter_map(|run| run.worker_pid)
-        .filter(|pid| terminate_process_group(*pid))
-        .count()
+struct InterruptTaskRunsOutcome {
+    interrupted_count: usize,
+    failed_run_ids: Vec<crate::task_orchestration::TaskRunId>,
+    cleanup_worktree_ids: Vec<crate::task_orchestration::WorktreeId>,
+}
+
+struct WorkspaceContext {
+    repo_root: PathBuf,
+    execution_mode: ProjectExecutionMode,
+}
+
+fn interrupt_task_runs(
+    outcome: &crate::task_orchestration::store::CancelTaskOutcome,
+) -> InterruptTaskRunsOutcome {
+    let mut interrupted_count = 0;
+    let mut failed_run_ids = Vec::new();
+    let mut cleanup_worktree_ids = Vec::new();
+    for run in &outcome.interrupted_runs {
+        let terminated = run.worker_pid.map(terminate_process_group).unwrap_or(true);
+        if terminated && run.worker_pid.is_some() {
+            interrupted_count += 1;
+        }
+        if !terminated {
+            failed_run_ids.push(run.run_id.clone());
+        }
+        if let Some(worktree_id) = run.worktree_id.clone() {
+            cleanup_worktree_ids.push(worktree_id);
+        }
+    }
+    InterruptTaskRunsOutcome {
+        interrupted_count,
+        failed_run_ids,
+        cleanup_worktree_ids,
+    }
 }
 
 fn terminate_process_group(pid: u32) -> bool {
@@ -677,6 +856,57 @@ fn resolve_prompt(inline: Option<&str>, file: Option<&Path>) -> Result<String> {
         (None, Some(path)) => Ok(fs::read_to_string(path)?),
         (None, None) => Err(AppError::TaskPromptRequired),
     }
+}
+
+fn resolve_workspace_context(workspace: Option<&Path>) -> Result<WorkspaceContext> {
+    let requested = match workspace {
+        Some(path) => resolve_path(path)?,
+        None => std::env::current_dir()?,
+    };
+    let requested = canonicalize_location(&requested)?;
+    let metadata = fs::metadata(&requested)?;
+    let requested = if metadata.is_dir() {
+        requested
+    } else {
+        requested
+            .parent()
+            .map(canonicalize_location)
+            .transpose()?
+            .ok_or_else(|| AppError::InvalidSchedulerConfiguration {
+                message: format!("workspace {} has no parent directory", requested.display()),
+            })?
+    };
+
+    if let Some(repo_root) = detect_git_repo_root(&requested) {
+        return Ok(WorkspaceContext {
+            repo_root,
+            execution_mode: ProjectExecutionMode::GitWorktree,
+        });
+    }
+
+    Ok(WorkspaceContext {
+        repo_root: requested,
+        execution_mode: ProjectExecutionMode::CopyWorkspace,
+    })
+}
+
+fn detect_git_repo_root(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let root = stdout.trim();
+    if root.is_empty() {
+        return None;
+    }
+    canonicalize_location(Path::new(root)).ok()
 }
 
 fn resolve_base_root(path: Option<&Path>) -> Result<PathBuf> {

@@ -15,6 +15,8 @@ It is designed around isolated `CODEX_HOME` roots per identity, not around rewri
 - can optionally retry `exec` on retryable auth/rate-limit failures with another healthy identity
 - supports probe-gated ChatGPT workspace forcing for identities that have been validated locally
 - supports durable task orchestration across multiple projects with SQLite-backed scheduler state
+- spreads unrelated scheduler-managed tasks across free identities when possible to reduce quota coupling
+- supports ad-hoc scheduler-backed jobs from the current workspace without manually registering a project first
 - tracks account leases and worktree leases independently from operator-facing selection state
 - runs scheduler-managed tasks through the App Server runtime and preserves thread continuity when possible
 
@@ -140,8 +142,12 @@ Task orchestration:
 
 ```bash
 codex-switch projects add --name repo-a --repo-root /path/to/repo-a --execution-mode git-worktree
+codex-switch projects add --name repo-b --repo-root /path/to/repo-b --execution-mode copy
 codex-switch scheduler enable
+codex-switch jobs run --title "Quick refactor" --prompt "Clean up the retry path"
 codex-switch tasks submit --project repo-a --title "Refactor scheduler" --prompt "Implement durable leases"
+codex-switch tasks submit --project repo-b --title "Fix flaky tests" --prompt "Stabilize the suite"
+codex-switch jobs follow-up <task-id> --prompt "Continue from the last review comments"
 codex-switch tasks follow-up <task-id> --prompt "Address the failing integration test"
 codex-switch tasks list
 codex-switch tasks show <task-id>
@@ -153,6 +159,36 @@ codex-switch scheduler gc
 codex-switch scheduler reset-state
 codex-switch scheduler disable
 ```
+
+Task orchestration is built for the multi-project, multi-task workflow where several unrelated jobs can run in parallel and should consume quota independently when possible.
+
+- New independent tasks are ranked toward free identities first, then by remaining quota headroom and identity priority.
+- Account occupancy is tracked with durable SQLite account leases, not with the current manual selection.
+- By default an identity gets at most one active scheduler-managed task at a time, so new unrelated tasks spread across available accounts before sharing one.
+- Follow-up and retry runs prefer the same identity as the previous successful run so they can resume the same thread directly.
+- If the preferred identity is not available, follow-up work can move to another identity through safe thread handoff.
+- If same-thread continuity is unsafe across identities, the scheduler falls back to checkpoint-based continuation instead of forcing an unsafe resume.
+- Every active run gets its own leased worktree, and scheduler-managed worktrees are never shared concurrently.
+- `jobs run` is the projectless entry point: it resolves the current directory or `--workspace` to a deterministic workspace project, reuses it when one already exists, and then submits the job through the same scheduler/task machinery.
+
+Example workflow:
+
+1. You register three projects and submit three unrelated tasks.
+2. The scheduler dispatches them to three different free identities when capacity exists, for example accounts 1, 2, and 5.
+3. One task finishes, and a brand-new unrelated task is submitted later. The scheduler treats it as a fresh lineage and can send it to a different free identity, for example account 4.
+4. Another task finishes, and you submit a follow-up. The scheduler first tries to keep it on the same identity and same thread. If that identity is unavailable, it can route the follow-up to another free identity through handoff or checkpoint fallback.
+5. A third task gets a follow-up while its previous identity is free, so the scheduler reuses that identity and resumes in the same thread.
+
+If you do not want to register a named project first, you can stay in your repository directory and use:
+
+```bash
+codex-switch scheduler enable
+codex-switch jobs run --title "Investigate CI flake" --prompt "Reproduce and fix the intermittent failure"
+codex-switch jobs list
+codex-switch jobs follow-up <task-id> --prompt "Address review feedback"
+```
+
+`jobs run` detects whether the workspace is inside a Git repository. Git workspaces default to `git-worktree`; non-Git directories default to copied workspaces.
 
 The scheduler rollout gate `scheduler_v1` is disabled by default. Use `codex-switch scheduler enable` before submitting or retrying scheduler-managed tasks. Read-only inspection commands remain available when the rollout gate is off.
 

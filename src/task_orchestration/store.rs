@@ -316,6 +316,7 @@ pub struct CancelTaskOutcome {
 pub struct CanceledRunRecord {
     pub run_id: TaskRunId,
     pub worker_pid: Option<u32>,
+    pub worktree_id: Option<WorktreeId>,
 }
 
 #[derive(Debug)]
@@ -325,20 +326,15 @@ pub struct SchedulerStore {
 }
 
 impl SchedulerStore {
-    pub fn reset_state(base_root: &Path) -> Result<()> {
-        let scheduler_root = scheduler_root_path(base_root);
-        if scheduler_root.exists() {
-            fs::remove_dir_all(&scheduler_root)?;
+    pub fn reset_state(base_root: &Path, settings: &SchedulerSettings) -> Result<()> {
+        let owner_id = format!("scheduler-reset-{}", std::process::id());
+        let mut store = Self::open(base_root)?;
+        store.acquire_scheduler_lock(&owner_id, settings.scheduler_lock_ttl)?;
+        let result = store.reset_state_locked(&owner_id);
+        if result.is_err() {
+            let _ = store.release_scheduler_lock(&owner_id);
         }
-        let task_artifacts = task_artifacts_path(base_root);
-        if task_artifacts.exists() {
-            fs::remove_dir_all(&task_artifacts)?;
-        }
-        let task_worktrees = task_worktrees_path(base_root);
-        if task_worktrees.exists() {
-            fs::remove_dir_all(&task_worktrees)?;
-        }
-        Ok(())
+        result
     }
 
     pub fn open(base_root: &Path) -> Result<Self> {
@@ -610,6 +606,45 @@ impl SchedulerStore {
             .ok_or_else(|| AppError::ProjectNotFound {
                 project: name_or_id.to_string(),
             })
+    }
+
+    pub fn projects_for_repo_root(&self, repo_root: &Path) -> Result<Vec<ProjectRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT project_id, name, repo_root, execution_mode, default_codex_args_json, default_model_or_profile, env_allowlist_json, cleanup_policy_json, created_at, updated_at
+             FROM projects
+             WHERE repo_root = ?1
+             ORDER BY created_at, name, project_id",
+        )?;
+        let mut rows = statement.query(params![repo_root.to_string_lossy().as_ref()])?;
+        let mut projects = Vec::new();
+        while let Some(row) = rows.next()? {
+            projects.push(project_from_row(row)?);
+        }
+        Ok(projects)
+    }
+
+    pub fn resolve_or_create_workspace_project(
+        &mut self,
+        repo_root: &Path,
+        execution_mode: ProjectExecutionMode,
+    ) -> Result<ProjectRecord> {
+        let mut matches = self.projects_for_repo_root(repo_root)?;
+        match matches.len() {
+            0 => self.create_project(ProjectSubmitRequest {
+                name: workspace_project_name(repo_root),
+                repo_root: repo_root.to_path_buf(),
+                execution_mode,
+                default_codex_args: Vec::new(),
+                default_model_or_profile: None,
+                env_allowlist: Vec::new(),
+                cleanup_policy: CleanupPolicy::default(),
+            }),
+            1 => Ok(matches.remove(0)),
+            _ => Err(AppError::WorkspaceProjectAmbiguous {
+                workspace_root: repo_root.to_path_buf(),
+                projects: matches.into_iter().map(|project| project.name).collect(),
+            }),
+        }
     }
 
     pub fn submit_task(&mut self, request: TaskSubmitRequest) -> Result<TaskLineageSnapshot> {
@@ -1819,9 +1854,9 @@ impl SchedulerStore {
             if let Some(worktree_id) = worktree_id.as_ref() {
                 tx.execute(
                     "UPDATE worktrees
-                     SET state = 'ready', updated_at = ?2, cleanup_after = ?3
+                     SET state = 'corrupted', reusable = 0, updated_at = ?2, cleanup_after = NULL
                      WHERE worktree_id = ?1",
-                    params![worktree_id.as_str(), now, now + 60 * 60],
+                    params![worktree_id.as_str(), now],
                 )?;
             }
         }
@@ -1849,9 +1884,53 @@ impl SchedulerStore {
             task_id: task,
             interrupted_runs: active_runs
                 .into_iter()
-                .map(|(run_id, worker_pid, _, _)| CanceledRunRecord { run_id, worker_pid })
+                .map(|(run_id, worker_pid, _, worktree_id)| CanceledRunRecord {
+                    run_id,
+                    worker_pid,
+                    worktree_id,
+                })
                 .collect(),
         })
+    }
+
+    pub fn schedule_canceled_worktree_cleanup(
+        &mut self,
+        worktree_ids: &[WorktreeId],
+        ttl: Duration,
+    ) -> Result<()> {
+        if worktree_ids.is_empty() {
+            return Ok(());
+        }
+        let now = current_timestamp()?;
+        let cleanup_after = now + ttl.as_secs() as i64;
+        let tx = self.connection.transaction()?;
+        for worktree_id in worktree_ids {
+            tx.execute(
+                "UPDATE worktrees
+                 SET cleanup_after = ?2, updated_at = ?3
+                 WHERE worktree_id = ?1 AND state = 'corrupted'",
+                params![worktree_id.as_str(), cleanup_after, now],
+            )?;
+        }
+        append_scheduler_event_tx(
+            &tx,
+            &SchedulerEventRecord::new(
+                None,
+                None,
+                None,
+                "canceled_worktree_cleanup_scheduled",
+                format!(
+                    "scheduled cleanup for {} canceled worktrees",
+                    worktree_ids.len()
+                ),
+                json!({
+                    "worktree_ids": worktree_ids,
+                    "cleanup_after": cleanup_after,
+                }),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn reserve_worktree_for_gc(
@@ -2128,6 +2207,76 @@ impl SchedulerStore {
             .optional()?;
         Ok(sequence_no.unwrap_or(0))
     }
+
+    fn reset_state_locked(&mut self, owner_id: &str) -> Result<()> {
+        let active_runs: usize = self.connection.query_row(
+            "SELECT COUNT(1) FROM task_runs WHERE status IN ('assigned', 'launching', 'running', 'handoff_pending')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let account_leases = self.active_account_leases()?.len();
+        let worktree_leases = self.worktree_leases()?.len();
+        if active_runs > 0 || account_leases > 0 || worktree_leases > 0 {
+            return Err(AppError::SchedulerResetBlocked {
+                active_runs,
+                account_leases,
+                worktree_leases,
+            });
+        }
+
+        let tx = self.connection.transaction()?;
+        let lock_owner = tx
+            .query_row(
+                "SELECT owner_id FROM scheduler_process_lock WHERE lock_name = 'dispatcher'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match lock_owner {
+            Some(lock_owner) if lock_owner == owner_id => {}
+            Some(lock_owner) => {
+                return Err(AppError::SchedulerAlreadyRunning {
+                    owner_id: lock_owner,
+                });
+            }
+            None => {
+                return Err(AppError::InvalidSchedulerConfiguration {
+                    message: "scheduler reset requires an active scheduler lock".to_string(),
+                });
+            }
+        }
+
+        tx.execute("DELETE FROM worktree_leases", [])?;
+        tx.execute("DELETE FROM account_leases", [])?;
+        tx.execute("DELETE FROM dispatch_decisions", [])?;
+        tx.execute("DELETE FROM task_run_inputs", [])?;
+        tx.execute("DELETE FROM task_runs", [])?;
+        tx.execute("DELETE FROM scheduler_events", [])?;
+        tx.execute("DELETE FROM worktrees", [])?;
+        tx.execute("DELETE FROM account_runtime", [])?;
+        tx.execute("DELETE FROM tasks", [])?;
+        tx.execute("DELETE FROM projects", [])?;
+        tx.execute(
+            "DELETE FROM scheduler_control WHERE control_key = ?1",
+            params![SCHEDULER_CONTROL_KEY],
+        )?;
+        tx.execute(
+            "DELETE FROM scheduler_process_lock WHERE lock_name = 'dispatcher'",
+            [],
+        )?;
+        tx.commit()?;
+
+        let task_artifacts = task_artifacts_path(&self.base_root);
+        if task_artifacts.exists() {
+            fs::remove_dir_all(&task_artifacts)?;
+        }
+        let task_worktrees = task_worktrees_path(&self.base_root);
+        if task_worktrees.exists() {
+            fs::remove_dir_all(&task_worktrees)?;
+        }
+        self.ensure_scheduler_control_row()?;
+        Ok(())
+    }
 }
 
 fn insert_task_tx(tx: &Transaction<'_>, task: &TaskRecord) -> Result<()> {
@@ -2278,6 +2427,10 @@ fn persist_run_prompt(
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
     project_from_row_prefix(row, 0)
+}
+
+fn workspace_project_name(repo_root: &Path) -> String {
+    format!("workspace:{}", repo_root.display())
 }
 
 fn project_from_row_prefix(
@@ -2564,6 +2717,68 @@ mod tests {
     }
 
     #[test]
+    fn resolves_existing_workspace_project_for_same_root() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let repo_root = temp.path().join("repo");
+        let project = store
+            .create_project(ProjectSubmitRequest {
+                name: "demo".to_string(),
+                repo_root: repo_root.clone(),
+                execution_mode: ProjectExecutionMode::CopyWorkspace,
+                default_codex_args: Vec::new(),
+                default_model_or_profile: None,
+                env_allowlist: Vec::new(),
+                cleanup_policy: CleanupPolicy::default(),
+            })
+            .unwrap();
+
+        let resolved = store
+            .resolve_or_create_workspace_project(&repo_root, ProjectExecutionMode::GitWorktree)
+            .unwrap();
+        assert_eq!(resolved.project_id, project.project_id);
+        assert_eq!(store.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_ambiguous_workspace_projects_for_same_root() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let repo_root = temp.path().join("repo");
+        store
+            .create_project(ProjectSubmitRequest {
+                name: "demo-a".to_string(),
+                repo_root: repo_root.clone(),
+                execution_mode: ProjectExecutionMode::CopyWorkspace,
+                default_codex_args: Vec::new(),
+                default_model_or_profile: None,
+                env_allowlist: Vec::new(),
+                cleanup_policy: CleanupPolicy::default(),
+            })
+            .unwrap();
+        store
+            .create_project(ProjectSubmitRequest {
+                name: "demo-b".to_string(),
+                repo_root: repo_root.clone(),
+                execution_mode: ProjectExecutionMode::GitWorktree,
+                default_codex_args: Vec::new(),
+                default_model_or_profile: None,
+                env_allowlist: Vec::new(),
+                cleanup_policy: CleanupPolicy::default(),
+            })
+            .unwrap();
+
+        let error = store
+            .resolve_or_create_workspace_project(&repo_root, ProjectExecutionMode::CopyWorkspace)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::WorkspaceProjectAmbiguous { projects, .. }
+                if projects == vec!["demo-a".to_string(), "demo-b".to_string()]
+        ));
+    }
+
+    #[test]
     fn scheduler_control_defaults_disabled_and_can_be_toggled() {
         let temp = tempdir().unwrap();
         let mut store = SchedulerStore::open(temp.path()).unwrap();
@@ -2833,6 +3048,26 @@ mod tests {
         assert_eq!(outcome.interrupted_runs[0].worker_pid, Some(9898));
         assert!(store.active_account_leases().unwrap().is_empty());
         assert!(store.worktree_leases().unwrap().is_empty());
+        let worktree = store
+            .get_worktree(outcome.interrupted_runs[0].worktree_id.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(worktree.state, WorktreeState::Corrupted);
+        assert!(worktree.cleanup_after.is_none());
+        assert!(store
+            .reusable_worktree_for_task(&snapshot.task.task_id)
+            .unwrap()
+            .is_none());
+
+        store
+            .schedule_canceled_worktree_cleanup(
+                &[outcome.interrupted_runs[0].worktree_id.clone().unwrap()],
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let worktree = store
+            .get_worktree(outcome.interrupted_runs[0].worktree_id.as_ref().unwrap())
+            .unwrap();
+        assert!(worktree.cleanup_after.is_some());
 
         store
             .finish_run(
@@ -2853,6 +3088,35 @@ mod tests {
         assert_eq!(canceled_run.status, TaskRunStatus::Canceled);
         let task = store.get_task(snapshot.task.task_id.as_str()).unwrap();
         assert_eq!(task.status, TaskStatus::Canceled);
+    }
+
+    #[test]
+    fn reset_state_is_blocked_while_active_runs_exist() {
+        let temp = tempdir().unwrap();
+        let mut store = SchedulerStore::open(temp.path()).unwrap();
+        let (project, snapshot) = create_project_and_task(&mut store, temp.path());
+        let run = snapshot.runs[0].clone();
+        let worktree = make_worktree(&project, &snapshot.task.task_id, temp.path().join("wt"));
+
+        claim_run(
+            &mut store,
+            &project,
+            &run,
+            &snapshot.task.task_id,
+            worktree,
+            "worker-lease-reset",
+        );
+
+        let error =
+            SchedulerStore::reset_state(temp.path(), &SchedulerSettings::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::SchedulerResetBlocked {
+                active_runs: 1,
+                account_leases: 1,
+                worktree_leases: 1,
+            }
+        ));
     }
 
     #[test]

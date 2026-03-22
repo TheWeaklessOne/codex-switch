@@ -227,6 +227,13 @@ pub enum AppError {
     #[error("scheduler lock is held by {owner_id}")]
     SchedulerAlreadyRunning { owner_id: String },
 
+    #[error("scheduler state reset is blocked while {active_runs} active runs, {account_leases} account leases, or {worktree_leases} worktree leases remain")]
+    SchedulerResetBlocked {
+        active_runs: usize,
+        account_leases: usize,
+        worktree_leases: usize,
+    },
+
     #[error("scheduler feature requires a git repository at {path}")]
     GitRepositoryRequired { path: PathBuf },
 
@@ -273,6 +280,12 @@ pub enum AppError {
 
     #[error("project {project} already exists")]
     ProjectAlreadyExists { project: String },
+
+    #[error("workspace {workspace_root} maps to multiple scheduler projects: {projects:?}; use an explicit --project")]
+    WorkspaceProjectAmbiguous {
+        workspace_root: PathBuf,
+        projects: Vec<String>,
+    },
 
     #[error("unsupported project execution mode {mode}")]
     UnsupportedProjectExecutionMode { mode: String },

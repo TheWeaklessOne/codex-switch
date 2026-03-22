@@ -52,7 +52,8 @@ use crate::workspace_switching::{
     WorkspaceForceProbeOutcome, WorkspaceSwitchingService,
 };
 use task_orchestration::{
-    run_projects, run_scheduler, run_tasks, ProjectsCommand, SchedulerCommand, TasksCommand,
+    run_jobs, run_projects, run_scheduler, run_tasks, JobsCommand, ProjectsCommand,
+    SchedulerCommand, TasksCommand,
 };
 
 pub fn run<I, T>(arguments: I) -> Result<()>
@@ -73,6 +74,7 @@ where
         Command::Continue(command) => run_continue(command),
         Command::Threads(command) => run_threads(command),
         Command::Projects(command) => run_projects(command),
+        Command::Jobs(command) => run_jobs(command),
         Command::Tasks(command) => run_tasks(command),
         Command::Scheduler(command) => run_scheduler(command),
     }
@@ -98,6 +100,7 @@ enum Command {
     Continue(ContinueCommand),
     Threads(ThreadsCommand),
     Projects(ProjectsCommand),
+    Jobs(JobsCommand),
     Tasks(TasksCommand),
     Scheduler(SchedulerCommand),
 }
