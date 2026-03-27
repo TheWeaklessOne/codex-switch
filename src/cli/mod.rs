@@ -1835,10 +1835,17 @@ fn print_account_overview(
         identity.display_name.clone()
     };
     println!("{name}");
-    if refresh_error.is_some() {
+    if let Some(refresh_error) = refresh_error {
         println!(
             "  {}",
-            style_text("stale quota: live refresh failed", "1;33", color_output)
+            style_text(
+                &format!(
+                    "stale quota: {}",
+                    summarize_account_refresh_error(refresh_error)
+                ),
+                "1;33",
+                color_output
+            )
         );
     }
     println!(
@@ -2350,6 +2357,38 @@ fn print_selection_summary(current: &CurrentIdentitySelection) {
     );
 }
 
+fn summarize_account_refresh_error(refresh_error: &str) -> String {
+    let http_status = extract_http_status_code(refresh_error);
+    let detail_code = extract_refresh_error_code(refresh_error);
+
+    match (http_status, detail_code) {
+        (Some(status), Some(code)) => format!("{status} {code}"),
+        (Some(status), None) => status,
+        (None, Some(code)) => code,
+        (None, None) => "live refresh failed".to_string(),
+    }
+}
+
+fn extract_http_status_code(refresh_error: &str) -> Option<String> {
+    let tail = refresh_error.rsplit(" failed: ").next()?;
+    let digits = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    (digits.len() == 3).then_some(digits)
+}
+
+fn extract_refresh_error_code(refresh_error: &str) -> Option<String> {
+    let body = refresh_error.split("body=").nth(1)?;
+    let payload: Value = serde_json::from_str(body).ok()?;
+    payload
+        .get("detail")
+        .and_then(|detail| detail.get("code"))
+        .or_else(|| payload.get("code"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn print_continue_result(result: &crate::continuation::ContinueThreadResult) {
     println!(
         "source identity: {} ({})",
@@ -2443,6 +2482,29 @@ fn print_thread_snapshot(snapshot: &ThreadSnapshot) {
     println!("updated at: {}", snapshot.updated_at);
     if let Some(path) = snapshot.path.as_deref() {
         println!("path: {}", path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_account_refresh_error;
+
+    #[test]
+    fn summarizes_refresh_error_with_http_status_and_detail_code() {
+        let error = r#"rpc call account/rateLimits/read failed with code -32603: failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 402 Payment Required; content-type=application/json; body={"detail":{"code":"deactivated_workspace"}}"#;
+        assert_eq!(
+            summarize_account_refresh_error(error),
+            "402 deactivated_workspace"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_generic_refresh_error_summary() {
+        let error = "rpc call account/read timed out after 20s";
+        assert_eq!(
+            summarize_account_refresh_error(error),
+            "live refresh failed"
+        );
     }
 }
 
