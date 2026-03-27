@@ -138,6 +138,34 @@ fn accounts_highlights_the_same_best_candidate_as_auto_selection() {
 }
 
 #[test]
+fn accounts_marks_stale_quota_when_live_refresh_fails() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let path = install_fake_codex(temp.path());
+
+    add_identity("Primary", &base_root_string);
+    add_identity("Backup", &base_root_string);
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .args(["accounts", "--base-root", &base_root_string])
+        .assert()
+        .success();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", "")
+        .args(["accounts", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stale quota: live refresh failed"))
+        .stdout(predicate::str::contains("80% left"))
+        .stdout(predicate::str::contains("45% left"));
+}
+
+#[test]
 fn accounts_highlights_identity_matching_default_codex_home() {
     let temp = tempdir().unwrap();
     let home_root = temp.path().join("home");

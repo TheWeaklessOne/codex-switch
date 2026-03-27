@@ -16,6 +16,7 @@ pub mod identity_selector;
 pub mod launcher;
 pub mod quota_status;
 pub mod selection_policy;
+pub mod session_control;
 pub mod shared_session_store;
 pub mod storage;
 pub mod task_orchestration;

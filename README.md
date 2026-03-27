@@ -4,6 +4,8 @@
 
 It is designed around isolated `CODEX_HOME` roots per identity, not around rewriting one global `~/.codex` in place.
 
+For external application integration, see [CONTROL_INTERFACE.md](./CONTROL_INTERFACE.md).
+
 ## What It Does
 
 - keeps one managed `CODEX_HOME` per identity
@@ -19,6 +21,8 @@ It is designed around isolated `CODEX_HOME` roots per identity, not around rewri
 - supports ad-hoc scheduler-backed jobs from the current workspace without manually registering a project first
 - tracks account leases and worktree leases independently from operator-facing selection state
 - runs scheduler-managed tasks through the App Server runtime and preserves thread continuity when possible
+- exposes a machine-facing session orchestration layer for durable `session` / `turn` / `handoff`
+  control with versioned `--json` responses and structured session event streaming
 
 ## Requirements
 
@@ -160,7 +164,24 @@ codex-switch scheduler reset-state
 codex-switch scheduler disable
 ```
 
+Machine-facing session orchestration:
+
+```bash
+codex-switch sessions start --topic-key telegram:chat-123:topic-9 --identity "Personal Plus" --json
+codex-switch turns start --session <session-id> --prompt "Investigate the failing tests" --json
+codex-switch turns wait --turn <turn-id> --json
+codex-switch sessions show --session <session-id> --json
+codex-switch sessions stream --session <session-id> --json
+codex-switch handoffs prepare --session <session-id> --to-identity "Backup Workspace" --reason quota --json
+codex-switch handoffs accept --handoff <handoff-id> --json
+codex-switch handoffs confirm --handoff <handoff-id> --observed-turn-id <runtime-turn-id> --json
+```
+
 Task orchestration is built for the multi-project, multi-task workflow where several unrelated jobs can run in parallel and should consume quota independently when possible.
+
+The machine-facing session control surface is separate from the scheduler-backed task surface. Use
+it when an external application needs one long-lived logical conversation mapped to one canonical
+thread and wants durable JSON state for sessions, turns, handoffs, and session event streaming.
 
 - New independent tasks are ranked toward free identities first, then by remaining quota headroom and identity priority.
 - Account occupancy is tracked with durable SQLite account leases, not with the current manual selection.

@@ -155,6 +155,15 @@ pub enum AppError {
     #[error("no handoff has been prepared for thread {thread_id}")]
     HandoffNotPrepared { thread_id: String },
 
+    #[error("session {session_id} is not registered")]
+    SessionNotFound { session_id: String },
+
+    #[error("turn {turn_id} is not registered")]
+    SessionTurnNotFound { turn_id: String },
+
+    #[error("handoff {handoff_id} is not registered")]
+    SessionHandoffNotFound { handoff_id: String },
+
     #[error("thread {thread_id} expected tracked state {expected} but found {actual}")]
     TrackedTurnStateConflict {
         thread_id: String,
@@ -180,6 +189,31 @@ pub enum AppError {
 
     #[error("continue requires either --to <identity> or --auto")]
     ContinueTargetRequired,
+
+    #[error("session {session_id} already has an active turn{active_turn_suffix}")]
+    SessionTurnAlreadyActive {
+        session_id: String,
+        active_turn_suffix: String,
+    },
+
+    #[error("session {session_id} has a pending handoff {handoff_id}")]
+    SessionHandoffPending {
+        session_id: String,
+        handoff_id: String,
+    },
+
+    #[error("session {session_id} cannot resume same-thread from {current_identity_id} to {requested_identity_id} without an explicit handoff or fallback")]
+    UnsafeSameThreadResume {
+        session_id: String,
+        current_identity_id: IdentityId,
+        requested_identity_id: IdentityId,
+    },
+
+    #[error("session {session_id} requires checkpoint fallback before more work can start")]
+    CheckpointFallbackRequired {
+        session_id: String,
+        handoff_id: Option<String>,
+    },
 
     #[error("inject requires either --identity <name> or --auto")]
     InjectIdentityRequired,
@@ -292,6 +326,15 @@ pub enum AppError {
 
     #[error("scheduler rollout gate scheduler_v1 is disabled for {operation}; run `codex-switch scheduler enable` first")]
     SchedulerFeatureDisabled { operation: String },
+
+    #[error("session-control runtime is unavailable: {message}")]
+    RuntimeUnavailable { message: String },
+
+    #[error("session-control state is invalid: {message}")]
+    InvalidSessionControlState { message: String },
+
+    #[error("machine-readable json failure has already been emitted")]
+    JsonFailureRendered,
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

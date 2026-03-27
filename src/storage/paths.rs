@@ -135,6 +135,14 @@ pub fn scheduler_db_path(base_root: &Path) -> PathBuf {
     scheduler_root_path(base_root).join("scheduler.db")
 }
 
+pub fn session_control_root_path(base_root: &Path) -> PathBuf {
+    base_root.join("shared").join("session-control")
+}
+
+pub fn session_control_db_path(base_root: &Path) -> PathBuf {
+    session_control_root_path(base_root).join("session-control.db")
+}
+
 pub fn task_artifacts_path(base_root: &Path) -> PathBuf {
     base_root.join("shared").join("task-artifacts")
 }

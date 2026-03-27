@@ -1,3 +1,4 @@
+mod session_control;
 mod task_orchestration;
 
 use std::ffi::OsString;
@@ -51,6 +52,9 @@ use crate::workspace_switching::{
     inject_auth_into_home, validate_workspace_force_identity, UpdateWorkspaceForceProbeRequest,
     WorkspaceForceProbeOutcome, WorkspaceSwitchingService,
 };
+use session_control::{
+    run_handoffs, run_sessions, run_turns, HandoffsCommand, SessionsCommand, TurnsCommand,
+};
 use task_orchestration::{
     run_jobs, run_projects, run_scheduler, run_tasks, JobsCommand, ProjectsCommand,
     SchedulerCommand, TasksCommand,
@@ -77,6 +81,9 @@ where
         Command::Jobs(command) => run_jobs(command),
         Command::Tasks(command) => run_tasks(command),
         Command::Scheduler(command) => run_scheduler(command),
+        Command::Sessions(command) => run_sessions(command),
+        Command::Turns(command) => run_turns(command),
+        Command::Handoffs(command) => run_handoffs(command),
     }
 }
 
@@ -103,6 +110,9 @@ enum Command {
     Jobs(JobsCommand),
     Tasks(TasksCommand),
     Scheduler(SchedulerCommand),
+    Sessions(SessionsCommand),
+    Turns(TurnsCommand),
+    Handoffs(HandoffsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -824,6 +834,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
         print_account_overview(
             &report.identity,
             report.quota_status.as_ref(),
+            report.refresh_error.as_deref(),
             default_codex_identity_ids.contains(&report.identity.id),
             color_output,
         );
@@ -1813,6 +1824,7 @@ fn print_identity_report(
 fn print_account_overview(
     identity: &CodexIdentity,
     quota_status: Option<&IdentityQuotaStatus>,
+    refresh_error: Option<&str>,
     matches_default_codex_home: bool,
     color_output: bool,
 ) {
@@ -1823,6 +1835,12 @@ fn print_account_overview(
         identity.display_name.clone()
     };
     println!("{name}");
+    if refresh_error.is_some() {
+        println!(
+            "  {}",
+            style_text("stale quota: live refresh failed", "1;33", color_output)
+        );
+    }
     println!(
         "  5h limit:    {}",
         format_account_window(find_window_by_duration(snapshot, 300), color_output)

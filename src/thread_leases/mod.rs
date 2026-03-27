@@ -196,6 +196,50 @@ where
         })
     }
 
+    pub fn abort_handoff(
+        &self,
+        thread_id: &str,
+        from_identity_id: &IdentityId,
+        pending_token: &str,
+    ) -> Result<ThreadLeaseRecord> {
+        self.store.with_locked_lease(thread_id, |current| {
+            let current = current.ok_or_else(|| AppError::ThreadLeaseNotFound {
+                thread_id: thread_id.to_string(),
+            })?;
+            if current.lease_state != ThreadLeaseState::HandoffPending {
+                return Err(AppError::ThreadLeaseStateConflict {
+                    thread_id: thread_id.to_string(),
+                    expected: ThreadLeaseState::HandoffPending,
+                    actual: current.lease_state,
+                });
+            }
+            if current.owner_identity_id != *from_identity_id {
+                return Err(AppError::ThreadLeaseHeld {
+                    thread_id: thread_id.to_string(),
+                    owner_identity_id: current.owner_identity_id,
+                });
+            }
+            if current.lease_token != pending_token {
+                return Err(AppError::ThreadLeaseTokenMismatch {
+                    thread_id: thread_id.to_string(),
+                });
+            }
+            let timestamp = current_timestamp()?;
+            let lease = ThreadLeaseRecord {
+                thread_id: thread_id.to_string(),
+                owner_identity_id: from_identity_id.clone(),
+                lease_state: ThreadLeaseState::Released,
+                lease_token: new_lease_token(),
+                handoff_to_identity_id: None,
+                handoff_reason: None,
+                last_heartbeat_at: current.last_heartbeat_at,
+                updated_at: timestamp,
+            };
+            self.store.save(&lease)?;
+            Ok(lease)
+        })
+    }
+
     pub fn release(
         &self,
         thread_id: &str,
@@ -312,6 +356,26 @@ mod tests {
         assert_eq!(transferred.lease_state, ThreadLeaseState::Active);
         assert_eq!(transferred.owner_identity_id, target);
         assert_ne!(transferred.lease_token, pending.lease_token);
+    }
+
+    #[test]
+    fn pending_handoff_can_be_aborted_without_leaking_the_lease() {
+        let temp = tempdir().unwrap();
+        let manager = ThreadLeaseManager::new(JsonThreadLeaseStore::test_store(temp.path()));
+        let source = IdentityId::from_display_name("Source").unwrap();
+        let target = IdentityId::from_display_name("Target").unwrap();
+
+        let active = manager.acquire("thread-1", &source).unwrap();
+        let pending = manager
+            .begin_handoff("thread-1", &source, &active.lease_token, &target, "quota")
+            .unwrap();
+
+        let released = manager
+            .abort_handoff("thread-1", &source, &pending.lease_token)
+            .unwrap();
+        assert_eq!(released.lease_state, ThreadLeaseState::Released);
+        assert_eq!(released.owner_identity_id, source);
+        assert!(released.handoff_to_identity_id.is_none());
     }
 
     #[test]
