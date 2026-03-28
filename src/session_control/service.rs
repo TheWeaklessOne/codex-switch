@@ -1502,7 +1502,7 @@ impl SessionControlWorker {
                     handoff_id: session_record.pending_handoff_id.as_ref(),
                     event: event_name,
                     timestamp: now,
-                    payload: &json!({ "rpc": message }),
+                    payload: &stream_event_payload(&message),
                 })?;
                 match event {
                     "turn/completed" => {
@@ -1667,6 +1667,30 @@ impl SessionControlWorker {
             CodexAppServerVerifier::default(),
         )
     }
+}
+
+fn stream_event_payload(message: &Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    if let Some(text_delta) = extract_renderable_text_delta(message) {
+        payload.insert("text_delta".to_string(), Value::String(text_delta));
+    }
+    payload.insert("rpc".to_string(), message.clone());
+    Value::Object(payload)
+}
+
+fn extract_renderable_text_delta(message: &Value) -> Option<String> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    if method != "turn/output" {
+        return None;
+    }
+    let delta = message
+        .get("params")
+        .and_then(|value| value.get("delta"))
+        .and_then(Value::as_str)?;
+    if delta.is_empty() {
+        return None;
+    }
+    Some(delta.to_string())
 }
 
 fn apply_terminal_session_state(

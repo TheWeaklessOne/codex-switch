@@ -318,13 +318,29 @@ Recommended event shape:
   "session_id": "session-123",
   "thread_id": "thread-456",
   "turn_id": "turn-789",
+  "runtime_turn_id": "runtime-turn-101",
   "timestamp": 1710000000,
-  "payload": {}
+  "payload": {
+    "text_delta": "working",
+    "rpc": {}
+  }
 }
 ```
 
 `sessions stream --json` emits these event records directly. It does not wrap the stream in the
 single-response success envelope.
+
+Stable bot-rendering contract:
+
+- `turn.output.delta` is the progressive visible-output event
+- `payload.text_delta` is the stable append-only text field for bot rendering
+- `payload.text_delta` is emitted only when the underlying runtime notification exposes safe
+  displayable appended text
+- `payload.rpc` may still be present for diagnostics, but bots should not need it for normal
+  rendering
+
+Bot consumers should treat other stream events as lifecycle/control updates rather than visible
+message content.
 
 ## Current CLI Notes
 
@@ -372,8 +388,10 @@ Recommended event types:
 
 For Telegram rendering:
 
-- `turn.output.delta` may carry plain text fragments
-- status events may carry short human summaries
+- render progressive visible output from `turn.output.delta` using `payload.text_delta`
+- ignore `payload.rpc` for normal rendering; it is diagnostic-only
+- treat `turn.started`, `turn.completed`, `turn.failed`, `turn.timed_out`, `turn.canceled`,
+  `session.status.changed`, and handoff events as state updates rather than appendable message text
 
 For machine control:
 

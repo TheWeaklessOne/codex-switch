@@ -251,6 +251,85 @@ fn machine_facing_session_flow_works_end_to_end() {
 }
 
 #[test]
+fn session_stream_emits_stable_text_delta_for_renderable_output() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("runtime");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let fake_bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+    let fake_codex = fake_bin_dir.join("codex");
+    write_fake_codex(&fake_codex);
+    register_identity(&base_root, "Source");
+
+    let started = run_json(
+        &base_root,
+        &fake_bin_dir,
+        &[
+            "sessions",
+            "start",
+            "--topic-key",
+            "topic-stream-text-delta",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--identity",
+            "Source",
+            "--json",
+        ],
+    );
+    let session_id = started["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let turn = run_json(
+        &base_root,
+        &fake_bin_dir,
+        &[
+            "turns",
+            "start",
+            "--session",
+            &session_id,
+            "--prompt",
+            "stream visible output",
+            "--identity",
+            "Source",
+            "--json",
+        ],
+    );
+    let turn_id = turn["data"]["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let waited = run_json(
+        &base_root,
+        &fake_bin_dir,
+        &["turns", "wait", "--turn", &turn_id, "--json"],
+    );
+    assert_eq!(waited["data"]["turn"]["status"].as_str(), Some("completed"));
+
+    let streamed = run_lines(
+        &base_root,
+        &fake_bin_dir,
+        &["sessions", "stream", "--session", &session_id, "--json"],
+    );
+    let output_delta = streamed
+        .iter()
+        .find(|event| event["event"] == "turn.output.delta")
+        .expect("expected turn.output.delta event");
+
+    assert_eq!(
+        output_delta["payload"]["text_delta"].as_str(),
+        Some("working")
+    );
+    assert_eq!(
+        output_delta["payload"]["rpc"]["method"].as_str(),
+        Some("turn/output")
+    );
+}
+
+#[test]
 fn rejects_unsafe_same_thread_resume_without_handoff() {
     let temp = tempdir().unwrap();
     let base_root = temp.path().join("runtime");
