@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Support
+    url: https://github.com/TheWeaklessOne/codex-switch/blob/main/SUPPORT.md
+    about: Read support guidance before opening a new issue.
+  - name: Security policy
+    url: https://github.com/TheWeaklessOne/codex-switch/blob/main/SECURITY.md
+    about: Please do not report vulnerabilities through public issues.

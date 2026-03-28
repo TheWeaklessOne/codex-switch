@@ -2,6 +2,13 @@
 name = "codex-switch"
 version = "0.1.0"
 edition = "2021"
+description = "Quota-aware Codex identity switcher with isolated CODEX_HOME management, safe thread handoff, and session orchestration."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/TheWeaklessOne/codex-switch"
+homepage = "https://github.com/TheWeaklessOne/codex-switch"
+keywords = ["codex", "cli", "automation", "quota", "workspace"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "codex_switch"

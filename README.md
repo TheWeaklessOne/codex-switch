@@ -1,10 +1,25 @@
 # codex-switch
 
+[![CI](https://github.com/TheWeaklessOne/codex-switch/actions/workflows/ci.yml/badge.svg)](https://github.com/TheWeaklessOne/codex-switch/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+
 `codex-switch` is a production-oriented CLI for running multiple isolated Codex identities on one machine, choosing the best available account for new work, and safely handing a shared thread from one identity to another.
 
 It is designed around isolated `CODEX_HOME` roots per identity, not around rewriting one global `~/.codex` in place.
 
-For external application integration, see [CONTROL_INTERFACE.md](./CONTROL_INTERFACE.md).
+Quick links:
+
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Runtime Layout](#runtime-layout)
+- [Safety Model](#safety-model)
+- [Contributing](./CONTRIBUTING.md)
+- [Security](./SECURITY.md)
+- [Support](./SUPPORT.md)
+
+For external application integration, see [CONTROL_INTERFACE.md](./CONTROL_INTERFACE.md) and [SESSION_CONTROL_INTERFACE.md](./SESSION_CONTROL_INTERFACE.md).
+
+`codex-switch` is an independent open source project and is not affiliated with OpenAI.
 
 ## What It Does
 
@@ -23,6 +38,20 @@ For external application integration, see [CONTROL_INTERFACE.md](./CONTROL_INTER
 - runs scheduler-managed tasks through the App Server runtime and preserves thread continuity when possible
 - exposes a machine-facing session orchestration layer for durable `session` / `turn` / `handoff`
   control with versioned `--json` responses and structured session event streaming
+
+## Documentation
+
+- [CONTROL_INTERFACE.md](./CONTROL_INTERFACE.md): machine-facing control surface and App Server integration notes
+- [SESSION_CONTROL_INTERFACE.md](./SESSION_CONTROL_INTERFACE.md): durable session / turn / handoff contract and stream event model
+- [CONTRIBUTING.md](./CONTRIBUTING.md): development workflow and local validation expectations
+- [SECURITY.md](./SECURITY.md): security reporting policy
+- [SUPPORT.md](./SUPPORT.md): where to ask for help and where to file issues
+
+## Project Status
+
+- actively developed and used for local multi-identity Codex workflows
+- validated primarily against `codex-cli 0.115.0`
+- interfaces documented in this repository are intended to be stable enough for operator use, but newer orchestration surfaces may still evolve
 
 ## Requirements
 
@@ -266,6 +295,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
+## Security
+
+Please read [SECURITY.md](./SECURITY.md) before reporting vulnerabilities.
+
+## Support
+
+See [SUPPORT.md](./SUPPORT.md) for bug reports, feature requests, and usage questions.
+
 ## License
 
-Licensed under [Apache-2.0](./LICENSE).
+Licensed under [Apache-2.0](./LICENSE). Additional attribution notes live in [NOTICE](./NOTICE).
