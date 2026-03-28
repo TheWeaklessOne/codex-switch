@@ -9,6 +9,7 @@ pub mod domain;
 pub mod error;
 pub mod exec_failover;
 pub mod handoff;
+pub mod identity_cleanup;
 pub mod identity_health;
 pub mod identity_registry;
 pub mod identity_selection;

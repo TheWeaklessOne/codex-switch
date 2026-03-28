@@ -166,6 +166,119 @@ fn accounts_marks_stale_quota_when_live_refresh_fails() {
 }
 
 #[test]
+fn accounts_auto_removes_deactivated_workspace_identities_and_notifies() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let path = install_fake_codex_with_deactivated_workspace(temp.path());
+    let deactivated_home = base_root.join("homes").join("deactivated");
+
+    add_identity("Healthy", &base_root_string);
+    add_identity("Deactivated", &base_root_string);
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["select", "Deactivated", "--base-root", &base_root_string])
+        .assert()
+        .success();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .args(["accounts", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Healthy"))
+        .stdout(predicate::str::contains("Deactivated").not())
+        .stderr(predicate::str::contains(
+            "notice: auto-removed Deactivated (deactivated) after live refresh returned 402 deactivated_workspace; cleared current selection",
+        ));
+
+    assert!(!deactivated_home.exists());
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["identities", "list", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Healthy (healthy)"))
+        .stdout(predicate::str::contains("Deactivated (deactivated)").not());
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["select", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no identity selected"));
+}
+
+#[test]
+fn select_auto_removes_deactivated_workspace_identities_and_notifies() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let path = install_fake_codex_with_deactivated_workspace(temp.path());
+
+    add_identity("Healthy", &base_root_string);
+    add_identity("Deactivated", &base_root_string);
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .args(["select", "--auto", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("selected Healthy"))
+        .stderr(predicate::str::contains(
+            "notice: auto-removed Deactivated (deactivated) after live refresh returned 402 deactivated_workspace",
+        ));
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["identities", "list", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Healthy (healthy)"))
+        .stdout(predicate::str::contains("Deactivated (deactivated)").not());
+}
+
+#[test]
+fn verify_auto_removes_deactivated_workspace_identity_and_notifies() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let path = install_fake_codex_with_deactivated_workspace(temp.path());
+    let deactivated_home = base_root.join("homes").join("deactivated");
+
+    add_identity("Deactivated", &base_root_string);
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["select", "Deactivated", "--base-root", &base_root_string])
+        .assert()
+        .success();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .args(["identities", "verify", "Deactivated", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "notice: auto-removed Deactivated (deactivated) after live refresh returned 402 deactivated_workspace; cleared current selection",
+        ));
+
+    assert!(!deactivated_home.exists());
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["identities", "list", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deactivated (deactivated)").not());
+}
+
+#[test]
 fn accounts_highlights_identity_matching_default_codex_home() {
     let temp = tempdir().unwrap();
     let home_root = temp.path().join("home");
@@ -398,6 +511,84 @@ if [ "$1" = "app-server" ]; then
         ;;
       *'"method":"account/rateLimits/read"'*)
         printf '{"jsonrpc":"2.0","id":"%s","result":%s}\n' "$id" "$rate_limit_payload"
+        ;;
+      *)
+        printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32601,"message":"unknown"}}\n' "$id"
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+echo "unexpected invocation: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&fake_codex_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex_path, permissions).unwrap();
+    }
+
+    format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn install_fake_codex_with_deactivated_workspace(root: &std::path::Path) -> String {
+    let fake_bin_dir = root.join("bin-deactivated");
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let fake_codex_path = fake_bin_dir.join("codex");
+    fs::write(
+        &fake_codex_path,
+        r#"#!/bin/sh
+identity=$(basename "$CODEX_HOME")
+
+auth_payload='{"authMethod":"chatgpt"}'
+
+case "$identity" in
+  healthy)
+    account_payload='{"account":{"type":"chatgpt","email":"healthy@example.com","planType":"plus"},"requiresOpenaiAuth":false}'
+    rate_limit_payload='{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1700003600},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1700603600}},"rateLimitsByLimitId":{"codex":{"limitId":"codex","limitName":"Codex","planType":"plus","primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1700003600},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1700603600}}}}'
+    ;;
+  deactivated)
+    account_payload='{"account":{"type":"chatgpt","email":"deactivated@example.com","planType":"team"},"requiresOpenaiAuth":false}'
+    rate_limit_error='failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 402 Payment Required; content-type=application/json; body={\"detail\":{\"code\":\"deactivated_workspace\"}}'
+    ;;
+  *)
+    account_payload='{"account":{"type":"chatgpt","email":"other@example.com","planType":"free"},"requiresOpenaiAuth":false}'
+    rate_limit_payload='{"rateLimits":{"primary":{"usedPercent":50,"windowDurationMins":300,"resetsAt":1700007200},"secondary":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","limitName":"Codex","planType":"free","primary":{"usedPercent":50,"windowDurationMins":300,"resetsAt":1700007200},"secondary":null}}}'
+    ;;
+esac
+
+if [ "$1" = "app-server" ]; then
+  read line
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2"}}\n' "$id"
+  read _
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+      *'"method":"getAuthStatus"'*)
+        printf '{"jsonrpc":"2.0","id":"%s","result":%s}\n' "$id" "$auth_payload"
+        ;;
+      *'"method":"account/read"'*)
+        printf '{"jsonrpc":"2.0","id":"%s","result":%s}\n' "$id" "$account_payload"
+        ;;
+      *'"method":"account/rateLimits/read"'*)
+        if [ "$identity" = "deactivated" ]; then
+          printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32603,"message":"%s"}}\n' "$id" "$rate_limit_error"
+        else
+          printf '{"jsonrpc":"2.0","id":"%s","result":%s}\n' "$id" "$rate_limit_payload"
+        fi
         ;;
       *)
         printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32601,"message":"unknown"}}\n' "$id"

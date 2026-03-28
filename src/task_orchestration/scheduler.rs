@@ -12,12 +12,16 @@ use crate::codex_rpc::CodexAppServerVerifier;
 use crate::domain::health::IdentityHealthRecord;
 use crate::domain::identity::{current_timestamp, CodexIdentity, IdentityId};
 use crate::error::{AppError, Result};
+use crate::identity_cleanup::{
+    auto_remove_deactivated_workspace_identities, ManagedIdentityRemovalService,
+};
 use crate::identity_selector::{IdentityEvaluation, IdentitySelector};
 use crate::quota_status::{IdentityStatusReport, QuotaStatusService};
 use crate::storage::health_store::{IdentityHealthStore, JsonIdentityHealthStore};
 use crate::storage::policy_store::{JsonSelectionPolicyStore, SelectionPolicyStore};
 use crate::storage::quota_store::JsonQuotaStore;
 use crate::storage::registry_store::{JsonRegistryStore, RegistryStore};
+use crate::storage::selection_store::JsonSelectionStore;
 use crate::task_orchestration::config::{SchedulerControlRecord, SchedulerSettings};
 use crate::task_orchestration::domain::*;
 use crate::task_orchestration::store::{
@@ -207,7 +211,15 @@ impl SchedulerDaemon {
         let service = QuotaStatusService::new(registry_store, quota_store);
         match service.refresh_all(&CodexAppServerVerifier::default()) {
             Ok(reports) => {
-                let errors = reports
+                let remover = ManagedIdentityRemovalService::new(
+                    JsonRegistryStore::new(&self.base_root),
+                    JsonQuotaStore::new(&self.base_root),
+                    JsonIdentityHealthStore::new(&self.base_root),
+                    JsonSelectionStore::new(&self.base_root),
+                );
+                let sweep = auto_remove_deactivated_workspace_identities(reports, &remover);
+                let mut errors = sweep
+                    .reports
                     .iter()
                     .filter_map(|report| {
                         report
@@ -216,8 +228,13 @@ impl SchedulerDaemon {
                             .map(|error| format!("{}: {error}", report.identity.id))
                     })
                     .collect::<Vec<_>>();
+                errors.extend(sweep.notices.iter().map(|notice| notice.summary()));
                 let error_summary = (!errors.is_empty()).then(|| errors.join("; "));
-                store.record_quota_refresh_outcome(now, error_summary.as_deref(), reports.len())?;
+                store.record_quota_refresh_outcome(
+                    now,
+                    error_summary.as_deref(),
+                    sweep.reports.len(),
+                )?;
             }
             Err(error) => {
                 let error_message = error.to_string();

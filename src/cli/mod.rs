@@ -33,21 +33,28 @@ use crate::exec_failover::{
     ExecFailoverRequest, ExecFailoverResult, ExecFailoverService, ExecFailoverStores,
 };
 use crate::handoff::{HandoffAcceptance, HandoffPreparation, HandoffService};
+use crate::identity_cleanup::{
+    auto_remove_deactivated_workspace_identities, AutoRemovalNotice, ManagedIdentityRemovalService,
+    WorkspaceDeactivationSummary,
+};
 use crate::identity_health::IdentityHealthService;
 use crate::identity_registry::IdentityRegistryService;
 use crate::identity_selection::{CurrentIdentitySelection, IdentitySelectionService};
 use crate::identity_selector::{IdentityEvaluation, IdentitySelector, SelectedIdentity};
 use crate::launcher::CodexLauncher;
-use crate::quota_status::{IdentityStatusReport, QuotaStatusService};
+use crate::quota_status::{
+    classify_identity_refresh_error, IdentityRefreshErrorKind, IdentityStatusReport,
+    QuotaStatusService,
+};
 use crate::selection_policy::{SelectionPolicyService, UpdateSelectionPolicyRequest};
 use crate::storage::checkpoint_store::JsonTaskCheckpointStore;
-use crate::storage::health_store::{IdentityHealthStore, JsonIdentityHealthStore};
+use crate::storage::health_store::JsonIdentityHealthStore;
 use crate::storage::paths::{default_base_root, default_codex_home, resolve_path};
 use crate::storage::policy_store::JsonSelectionPolicyStore;
-use crate::storage::quota_store::{JsonQuotaStore, QuotaStore};
-use crate::storage::registry_store::{JsonRegistryStore, RegistryStore};
+use crate::storage::quota_store::JsonQuotaStore;
+use crate::storage::registry_store::JsonRegistryStore;
 use crate::storage::selection_event_store::JsonSelectionEventStore;
-use crate::storage::selection_store::{JsonSelectionStore, SelectionStore};
+use crate::storage::selection_store::JsonSelectionStore;
 use crate::workspace_switching::{
     inject_auth_into_home, validate_workspace_force_identity, UpdateWorkspaceForceProbeRequest,
     WorkspaceForceProbeOutcome, WorkspaceSwitchingService,
@@ -660,12 +667,18 @@ fn run_login_identity(command: LoginIdentityCommand) -> Result<()> {
 
 fn run_verify_identity(command: VerifyIdentityCommand) -> Result<()> {
     let base_root = resolve_base_root(command.base_root.as_deref())?;
-    verify_identity_by_name(&base_root, &command.name)
+    verify_identity_by_name(&base_root, &command.name).map(|_| ())
 }
 
 fn run_remove_identity(command: RemoveIdentityCommand) -> Result<()> {
     let base_root = resolve_base_root(command.base_root.as_deref())?;
-    let outcome = remove_identity_everywhere(&base_root, &command.name)?;
+    let removal_service = ManagedIdentityRemovalService::new(
+        JsonRegistryStore::new(&base_root),
+        JsonQuotaStore::new(&base_root),
+        JsonIdentityHealthStore::new(&base_root),
+        JsonSelectionStore::new(&base_root),
+    );
+    let outcome = removal_service.remove_identity_by_name(&command.name)?;
     println!(
         "removed {} ({})",
         outcome.identity.display_name, outcome.identity.id
@@ -782,6 +795,10 @@ fn run_workspace_force(command: WorkspaceForceCommand) -> Result<()> {
 
 fn run_status(command: StatusCommand) -> Result<()> {
     let base_root = resolve_base_root(command.base_root.as_deref())?;
+    let loaded = load_identity_reports(&base_root, command.cached)?;
+    print_auto_removal_notices(&loaded.auto_removal_notices);
+    let reports = loaded.reports;
+
     let selection_service = build_selection_service(&base_root);
     match selection_service.current()? {
         Some(current) => print_selection_summary(&current),
@@ -789,7 +806,6 @@ fn run_status(command: StatusCommand) -> Result<()> {
     }
 
     let (selector, health) = load_selector_context(&base_root)?;
-    let reports = load_identity_reports(&base_root, command.cached)?;
 
     if reports.is_empty() {
         println!("no identities registered");
@@ -814,8 +830,10 @@ fn run_status(command: StatusCommand) -> Result<()> {
 
 fn run_accounts(command: AccountsCommand) -> Result<()> {
     let base_root = resolve_base_root(command.base_root.as_deref())?;
+    let loaded = load_identity_reports(&base_root, command.cached)?;
+    print_auto_removal_notices(&loaded.auto_removal_notices);
+    let reports = loaded.reports;
     let (selector, health) = load_selector_context(&base_root)?;
-    let reports = load_identity_reports(&base_root, command.cached)?;
 
     if reports.is_empty() {
         println!("no identities registered");
@@ -834,6 +852,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
         print_account_overview(
             &report.identity,
             report.quota_status.as_ref(),
+            report.refresh_error_kind.as_ref(),
             report.refresh_error.as_deref(),
             default_codex_identity_ids.contains(&report.identity.id),
             color_output,
@@ -863,6 +882,7 @@ fn run_select(command: SelectCommand) -> Result<()> {
     if command.auto {
         let result = build_automatic_selection_service(&base_root)
             .select_for_new_session(command.cached, "selected automatically from quota state")?;
+        print_auto_removal_notices(&result.auto_removal_notices);
         print_selected_identity(&result.selected);
         let current = result.current;
         println!("selection mode: {}", current.selection.mode);
@@ -1121,18 +1141,20 @@ fn resolve_runtime_identity(
     }
 
     if auto {
-        return Ok(build_automatic_selection_service(base_root)
-            .select_for_new_session(cached, "selected automatically for launch")?
-            .selected
-            .identity);
+        let result = build_automatic_selection_service(base_root)
+            .select_for_new_session(cached, "selected automatically for launch")?;
+        print_auto_removal_notices(&result.auto_removal_notices);
+        return Ok(result.selected.identity);
     }
 
     match selection_service.current()? {
         Some(current) if current.selection.mode == SelectionMode::Manual => Ok(current.identity),
-        _ => Ok(build_automatic_selection_service(base_root)
-            .select_for_new_session(cached, "selected automatically for launch")?
-            .selected
-            .identity),
+        _ => {
+            let result = build_automatic_selection_service(base_root)
+                .select_for_new_session(cached, "selected automatically for launch")?;
+            print_auto_removal_notices(&result.auto_removal_notices);
+            Ok(result.selected.identity)
+        }
     }
 }
 
@@ -1222,20 +1244,90 @@ fn build_quota_status_service(
     )
 }
 
-fn load_identity_reports(base_root: &Path, cached: bool) -> Result<Vec<IdentityStatusReport>> {
+struct LoadedIdentityReports {
+    reports: Vec<IdentityStatusReport>,
+    auto_removal_notices: Vec<AutoRemovalNotice>,
+}
+
+enum VerifyIdentityOutcome {
+    Verified,
+    AutoRemoved,
+}
+
+fn load_identity_reports(base_root: &Path, cached: bool) -> Result<LoadedIdentityReports> {
     let service = build_quota_status_service(base_root);
     if cached {
-        service.cached_statuses()
+        Ok(LoadedIdentityReports {
+            reports: service.cached_statuses()?,
+            auto_removal_notices: Vec::new(),
+        })
     } else {
-        service.refresh_all(&CodexAppServerVerifier::default())
+        let reports = service.refresh_all(&CodexAppServerVerifier::default())?;
+        let remover = ManagedIdentityRemovalService::new(
+            JsonRegistryStore::new(base_root),
+            JsonQuotaStore::new(base_root),
+            JsonIdentityHealthStore::new(base_root),
+            JsonSelectionStore::new(base_root),
+        );
+        let sweep = auto_remove_deactivated_workspace_identities(reports, &remover);
+        Ok(LoadedIdentityReports {
+            reports: sweep.reports,
+            auto_removal_notices: sweep.notices,
+        })
     }
 }
 
-fn verify_identity_by_name(base_root: &Path, identity_name: &str) -> Result<()> {
+fn verify_identity_by_name(base_root: &Path, identity_name: &str) -> Result<VerifyIdentityOutcome> {
     let service = build_quota_status_service(base_root);
-    let refreshed = service.refresh_identity(identity_name, &CodexAppServerVerifier::default())?;
-    print_verification(refreshed.identity, refreshed.verification);
-    Ok(())
+    match service.refresh_identity(identity_name, &CodexAppServerVerifier::default()) {
+        Ok(refreshed) => {
+            print_verification(refreshed.identity, refreshed.verification);
+            Ok(VerifyIdentityOutcome::Verified)
+        }
+        Err(error) => {
+            if let Some(notice) =
+                maybe_auto_remove_identity_after_refresh_error(base_root, identity_name, &error)?
+            {
+                print_auto_removal_notices(std::slice::from_ref(&notice));
+                return Ok(VerifyIdentityOutcome::AutoRemoved);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn maybe_auto_remove_identity_after_refresh_error(
+    base_root: &Path,
+    identity_name: &str,
+    error: &AppError,
+) -> Result<Option<AutoRemovalNotice>> {
+    let Some(IdentityRefreshErrorKind::WorkspaceDeactivated { http_status, code }) =
+        classify_identity_refresh_error(error)
+    else {
+        return Ok(None);
+    };
+
+    let reason = WorkspaceDeactivationSummary { http_status, code };
+    let identity = build_selection_service(base_root).resolve_by_name(identity_name)?;
+    let remover = ManagedIdentityRemovalService::new(
+        JsonRegistryStore::new(base_root),
+        JsonQuotaStore::new(base_root),
+        JsonIdentityHealthStore::new(base_root),
+        JsonSelectionStore::new(base_root),
+    );
+    let notice = match remover.remove_identity_by_name(identity_name) {
+        Ok(outcome) => AutoRemovalNotice::Removed {
+            identity: outcome.identity,
+            reason,
+            selection_cleared: outcome.selection_cleared,
+        },
+        Err(remove_error) => AutoRemovalNotice::RemovalFailed {
+            identity,
+            reason,
+            error: remove_error.to_string(),
+        },
+    };
+    Ok(Some(notice))
 }
 
 fn login_identity(base_root: &Path, identity: &CodexIdentity, no_verify: bool) -> Result<()> {
@@ -1256,7 +1348,7 @@ fn login_identity(base_root: &Path, identity: &CodexIdentity, no_verify: bool) -
         return Ok(());
     }
     match verify_identity_by_name(base_root, &identity.display_name) {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) => {
             eprintln!("warning: login succeeded but post-login verification failed: {error}");
             println!("verification deferred");
@@ -1296,229 +1388,6 @@ fn build_identity_health_service(
         JsonRegistryStore::new(base_root),
         JsonIdentityHealthStore::new(base_root),
     )
-}
-
-#[derive(Debug, Clone)]
-struct RemoveIdentityOutcome {
-    identity: CodexIdentity,
-    selection_cleared: bool,
-    home_removed: bool,
-}
-
-#[derive(Debug, Clone)]
-struct StagedHomeRemoval {
-    original_path: PathBuf,
-    staged_path: PathBuf,
-}
-
-#[derive(Clone, Copy)]
-struct RemoveIdentityRollbackContext<'a> {
-    registry: Option<(
-        &'a JsonRegistryStore,
-        &'a crate::domain::identity::IdentityRegistryRecord,
-    )>,
-    selection_store: &'a JsonSelectionStore,
-    original_selection: &'a crate::domain::selection::SelectionStateRecord,
-    quota: Option<(
-        &'a JsonQuotaStore,
-        &'a crate::domain::quota::QuotaStatusRecord,
-    )>,
-    health: Option<(
-        &'a JsonIdentityHealthStore,
-        &'a crate::domain::health::IdentityHealthRecord,
-    )>,
-    staged_home: Option<&'a StagedHomeRemoval>,
-}
-
-fn remove_identity_everywhere(
-    base_root: &Path,
-    identity_name: &str,
-) -> Result<RemoveIdentityOutcome> {
-    let registry_store = JsonRegistryStore::new(base_root);
-    let quota_store = JsonQuotaStore::new(base_root);
-    let health_store = JsonIdentityHealthStore::new(base_root);
-    let selection_store = JsonSelectionStore::new(base_root);
-
-    let original_registry = registry_store.load()?;
-    let mut updated_registry = original_registry.clone();
-    let identity_id = IdentityId::from_display_name(identity_name)?;
-    let removed_identity = updated_registry
-        .identities
-        .remove(&identity_id)
-        .ok_or_else(|| AppError::IdentityNotFound {
-            identity_id: identity_id.clone(),
-        })?;
-
-    let original_quota = quota_store.load()?;
-    let mut updated_quota = original_quota.clone();
-    updated_quota.statuses.remove(&identity_id);
-
-    let original_health = health_store.load()?;
-    let mut updated_health = original_health.clone();
-    updated_health.identities.remove(&identity_id);
-
-    let original_selection = selection_store.load()?;
-    let mut updated_selection = original_selection.clone();
-    let selection_cleared = updated_selection
-        .current
-        .as_ref()
-        .is_some_and(|current| current.identity_id == identity_id);
-    if selection_cleared {
-        updated_selection.current = None;
-    }
-
-    let staged_home = stage_identity_home_removal(&removed_identity.codex_home)?;
-    let rollback_context = RemoveIdentityRollbackContext {
-        registry: Some((&registry_store, &original_registry)),
-        selection_store: &selection_store,
-        original_selection: &original_selection,
-        quota: Some((&quota_store, &original_quota)),
-        health: Some((&health_store, &original_health)),
-        staged_home: staged_home.as_ref(),
-    };
-    selection_store.save(&updated_selection)?;
-    if let Err(primary) = quota_store.save(&updated_quota) {
-        return Err(rollback_remove_identity(
-            primary,
-            "remove identity",
-            RemoveIdentityRollbackContext {
-                quota: None,
-                health: None,
-                ..rollback_context
-            },
-        ));
-    }
-    if let Err(primary) = health_store.save(&updated_health) {
-        return Err(rollback_remove_identity(
-            primary,
-            "remove identity",
-            RemoveIdentityRollbackContext {
-                health: None,
-                ..rollback_context
-            },
-        ));
-    }
-    if let Err(primary) = registry_store.save(&updated_registry) {
-        return Err(rollback_remove_identity(
-            primary,
-            "remove identity",
-            rollback_context,
-        ));
-    }
-
-    if let Some(staged_home) = staged_home.as_ref() {
-        if let Err(primary) = delete_staged_identity_home(staged_home) {
-            return Err(rollback_remove_identity(
-                primary,
-                "remove identity",
-                rollback_context,
-            ));
-        }
-    }
-
-    Ok(RemoveIdentityOutcome {
-        identity: removed_identity,
-        selection_cleared,
-        home_removed: staged_home.is_some(),
-    })
-}
-
-fn rollback_remove_identity(
-    primary: AppError,
-    operation: &str,
-    context: RemoveIdentityRollbackContext<'_>,
-) -> AppError {
-    let RemoveIdentityRollbackContext {
-        registry,
-        selection_store,
-        original_selection,
-        quota,
-        health,
-        staged_home,
-    } = context;
-    let mut rollback_errors = Vec::new();
-
-    if let Some((store, record)) = registry {
-        if let Err(error) = store.save(record) {
-            rollback_errors.push(format!("restore registry: {error}"));
-        }
-    }
-
-    if let Some((store, record)) = health {
-        if let Err(error) = store.save(record) {
-            rollback_errors.push(format!("restore identity health: {error}"));
-        }
-    }
-
-    if let Some((store, record)) = quota {
-        if let Err(error) = store.save(record) {
-            rollback_errors.push(format!("restore quota status: {error}"));
-        }
-    }
-
-    if let Err(error) = selection_store.save(original_selection) {
-        rollback_errors.push(format!("restore selection state: {error}"));
-    }
-
-    if let Some(staged_home) = staged_home {
-        if let Err(error) = restore_staged_identity_home(staged_home) {
-            rollback_errors.push(format!("restore identity home: {error}"));
-        }
-    }
-
-    if rollback_errors.is_empty() {
-        primary
-    } else {
-        AppError::RollbackFailed {
-            operation: operation.to_string(),
-            primary: primary.to_string(),
-            rollback: rollback_errors.join("; "),
-        }
-    }
-}
-
-fn stage_identity_home_removal(path: &Path) -> Result<Option<StagedHomeRemoval>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(AppError::UnexpectedSymlink {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(AppError::ExpectedDirectory {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| AppError::ExpectedDirectory {
-            path: path.to_path_buf(),
-        })?;
-    let staged_path = path.with_file_name(format!(
-        ".{}.removing-{}",
-        file_name.to_string_lossy(),
-        current_timestamp()?
-    ));
-    std::fs::rename(path, &staged_path)?;
-    Ok(Some(StagedHomeRemoval {
-        original_path: path.to_path_buf(),
-        staged_path,
-    }))
-}
-
-fn restore_staged_identity_home(staged_home: &StagedHomeRemoval) -> Result<()> {
-    std::fs::rename(&staged_home.staged_path, &staged_home.original_path)?;
-    Ok(())
-}
-
-fn delete_staged_identity_home(staged_home: &StagedHomeRemoval) -> Result<()> {
-    std::fs::remove_dir_all(&staged_home.staged_path)?;
-    Ok(())
 }
 
 fn build_selection_service(
@@ -1802,6 +1671,7 @@ fn print_identity_report(
         identity,
         quota_status,
         refresh_error,
+        refresh_error_kind: _,
     } = report;
 
     println!("{} ({})", identity.display_name, identity.id);
@@ -1824,6 +1694,7 @@ fn print_identity_report(
 fn print_account_overview(
     identity: &CodexIdentity,
     quota_status: Option<&IdentityQuotaStatus>,
+    refresh_error_kind: Option<&crate::quota_status::IdentityRefreshErrorKind>,
     refresh_error: Option<&str>,
     matches_default_codex_home: bool,
     color_output: bool,
@@ -1841,7 +1712,7 @@ fn print_account_overview(
             style_text(
                 &format!(
                     "stale quota: {}",
-                    summarize_account_refresh_error(refresh_error)
+                    summarize_account_refresh_error(refresh_error_kind, refresh_error)
                 ),
                 "1;33",
                 color_output
@@ -1951,6 +1822,8 @@ fn print_selected_identity(selected: &SelectedIdentity) {
 }
 
 fn print_exec_failover_result(result: &ExecFailoverResult) {
+    print_auto_removal_notices(&result.auto_removal_notices);
+
     if let Some(initial_identity) = result.initial_identity.as_ref() {
         println!(
             "initial identity: {} ({})",
@@ -2357,36 +2230,31 @@ fn print_selection_summary(current: &CurrentIdentitySelection) {
     );
 }
 
-fn summarize_account_refresh_error(refresh_error: &str) -> String {
-    let http_status = extract_http_status_code(refresh_error);
-    let detail_code = extract_refresh_error_code(refresh_error);
-
-    match (http_status, detail_code) {
-        (Some(status), Some(code)) => format!("{status} {code}"),
-        (Some(status), None) => status,
-        (None, Some(code)) => code,
-        (None, None) => "live refresh failed".to_string(),
+fn print_auto_removal_notices(notices: &[AutoRemovalNotice]) {
+    for notice in notices {
+        let prefix = if notice.is_failure() {
+            "warning"
+        } else {
+            "notice"
+        };
+        eprintln!("{prefix}: {}", notice.summary());
     }
 }
 
-fn extract_http_status_code(refresh_error: &str) -> Option<String> {
-    let tail = refresh_error.rsplit(" failed: ").next()?;
-    let digits = tail
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>();
-    (digits.len() == 3).then_some(digits)
-}
+fn summarize_account_refresh_error(
+    refresh_error_kind: Option<&crate::quota_status::IdentityRefreshErrorKind>,
+    refresh_error: &str,
+) -> String {
+    if let Some(crate::quota_status::IdentityRefreshErrorKind::WorkspaceDeactivated {
+        http_status,
+        code,
+    }) = refresh_error_kind
+    {
+        return format!("{http_status} {code}");
+    }
 
-fn extract_refresh_error_code(refresh_error: &str) -> Option<String> {
-    let body = refresh_error.split("body=").nth(1)?;
-    let payload: Value = serde_json::from_str(body).ok()?;
-    payload
-        .get("detail")
-        .and_then(|detail| detail.get("code"))
-        .or_else(|| payload.get("code"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    let _ = refresh_error;
+    "live refresh failed".to_string()
 }
 
 fn print_continue_result(result: &crate::continuation::ContinueThreadResult) {
@@ -2488,12 +2356,19 @@ fn print_thread_snapshot(snapshot: &ThreadSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::summarize_account_refresh_error;
+    use crate::quota_status::IdentityRefreshErrorKind;
 
     #[test]
     fn summarizes_refresh_error_with_http_status_and_detail_code() {
         let error = r#"rpc call account/rateLimits/read failed with code -32603: failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 402 Payment Required; content-type=application/json; body={"detail":{"code":"deactivated_workspace"}}"#;
         assert_eq!(
-            summarize_account_refresh_error(error),
+            summarize_account_refresh_error(
+                Some(&IdentityRefreshErrorKind::WorkspaceDeactivated {
+                    http_status: 402,
+                    code: "deactivated_workspace".to_string(),
+                }),
+                error,
+            ),
             "402 deactivated_workspace"
         );
     }
@@ -2502,7 +2377,7 @@ mod tests {
     fn falls_back_to_generic_refresh_error_summary() {
         let error = "rpc call account/read timed out after 20s";
         assert_eq!(
-            summarize_account_refresh_error(error),
+            summarize_account_refresh_error(None, error),
             "live refresh failed"
         );
     }

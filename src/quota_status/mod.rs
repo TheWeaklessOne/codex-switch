@@ -1,6 +1,8 @@
 use std::thread;
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::codex_rpc::IdentityVerifier;
 use crate::domain::identity::{current_timestamp, CodexIdentity, IdentityId};
 use crate::domain::quota::IdentityQuotaStatus;
@@ -14,6 +16,12 @@ pub struct IdentityStatusReport {
     pub identity: CodexIdentity,
     pub quota_status: Option<IdentityQuotaStatus>,
     pub refresh_error: Option<String>,
+    pub refresh_error_kind: Option<IdentityRefreshErrorKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityRefreshErrorKind {
+    WorkspaceDeactivated { http_status: u16, code: String },
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +70,7 @@ where
                     identity,
                     quota_status,
                     refresh_error: None,
+                    refresh_error_kind: None,
                 }
             })
             .collect())
@@ -177,12 +186,14 @@ where
                         identity: identity.clone(),
                         quota_status: Some(quota_status),
                         refresh_error: None,
+                        refresh_error_kind: None,
                     });
                 }
                 Err(error) => {
                     reports.push(IdentityStatusReport {
                         identity: identity.clone(),
                         quota_status: cached_quota_status,
+                        refresh_error_kind: classify_identity_refresh_error(&error),
                         refresh_error: Some(error.to_string()),
                     });
                 }
@@ -248,7 +259,7 @@ fn is_retryable_refresh_error(error: &AppError) -> bool {
         | AppError::MissingRpcResult { .. } => true,
         AppError::ChildProcessFailed { .. } => true,
         AppError::RpcServer { code, message, .. } => {
-            if is_known_non_retryable_refresh_error(*code, message) {
+            if classify_rpc_server_refresh_error(*code, message).is_some() {
                 return false;
             }
             *code == -32603 || *code == -32000
@@ -257,13 +268,52 @@ fn is_retryable_refresh_error(error: &AppError) -> bool {
     }
 }
 
-fn is_known_non_retryable_refresh_error(code: i64, message: &str) -> bool {
+pub fn classify_identity_refresh_error(error: &AppError) -> Option<IdentityRefreshErrorKind> {
+    match error {
+        AppError::RpcServer { code, message, .. } => {
+            classify_rpc_server_refresh_error(*code, message)
+        }
+        _ => None,
+    }
+}
+
+fn classify_rpc_server_refresh_error(code: i64, message: &str) -> Option<IdentityRefreshErrorKind> {
     if code != -32603 {
-        return false;
+        return None;
     }
 
-    let lower = message.to_ascii_lowercase();
-    lower.contains("deactivated_workspace") || lower.contains("402 payment required")
+    let http_status = extract_http_status_code(message)?;
+    let error_code = extract_refresh_error_code(message)?;
+    if http_status == 402 && error_code == "deactivated_workspace" {
+        return Some(IdentityRefreshErrorKind::WorkspaceDeactivated {
+            http_status,
+            code: error_code,
+        });
+    }
+    None
+}
+
+fn extract_http_status_code(message: &str) -> Option<u16> {
+    let tail = message.rsplit(" failed: ").next()?;
+    let digits = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.len() != 3 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn extract_refresh_error_code(message: &str) -> Option<String> {
+    let body = message.split("body=").nth(1)?;
+    let payload: Value = serde_json::from_str(body).ok()?;
+    payload
+        .get("detail")
+        .and_then(|detail| detail.get("code"))
+        .or_else(|| payload.get("code"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn refresh_concurrency(identity_count: usize) -> usize {
@@ -289,7 +339,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::QuotaStatusService;
+    use super::{IdentityRefreshErrorKind, QuotaStatusService};
     use crate::bootstrap::BootstrapIdentityRequest;
     use crate::codex_rpc::IdentityVerifier;
     use crate::domain::identity::{AccountType, AuthMode, PlanType};
@@ -580,6 +630,13 @@ mod tests {
         assert_eq!(verifier.attempts_for("primary"), 1);
         assert_eq!(reports.len(), 1);
         assert!(reports[0].refresh_error.is_some());
+        assert_eq!(
+            reports[0].refresh_error_kind,
+            Some(IdentityRefreshErrorKind::WorkspaceDeactivated {
+                http_status: 402,
+                code: "deactivated_workspace".to_string(),
+            })
+        );
     }
 
     #[test]

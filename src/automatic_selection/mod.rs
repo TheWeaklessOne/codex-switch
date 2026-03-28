@@ -4,6 +4,9 @@ use crate::codex_rpc::IdentityVerifier;
 use crate::decision_log::{DecisionLogService, LoggedSelectionEvent};
 use crate::domain::identity::current_timestamp;
 use crate::error::Result;
+use crate::identity_cleanup::{
+    auto_remove_deactivated_workspace_identities, AutoRemovalNotice, ManagedIdentityRemovalService,
+};
 use crate::identity_selection::{CurrentIdentitySelection, IdentitySelectionService};
 use crate::identity_selector::{IdentitySelector, SelectedIdentity};
 use crate::quota_status::{IdentityStatusReport, QuotaStatusService};
@@ -19,6 +22,7 @@ pub struct AutomaticSelectionResult {
     pub selected: SelectedIdentity,
     pub current: CurrentIdentitySelection,
     pub decision_log: LoggedSelectionEvent,
+    pub auto_removal_notices: Vec<AutoRemovalNotice>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +80,22 @@ where
         } else {
             quota_service.refresh_all(&self.verifier)?
         };
-        self.select_from_reports(reports, cached, reason)
+        let auto_removal_notices;
+        let reports = if cached {
+            auto_removal_notices = Vec::new();
+            reports
+        } else {
+            let remover = ManagedIdentityRemovalService::new(
+                self.registry_store.clone(),
+                self.quota_store.clone(),
+                self.health_store.clone(),
+                self.selection_store.clone(),
+            );
+            let sweep = auto_remove_deactivated_workspace_identities(reports, &remover);
+            auto_removal_notices = sweep.notices;
+            sweep.reports
+        };
+        self.select_from_reports(reports, cached, reason, auto_removal_notices)
     }
 
     pub fn select_from_reports(
@@ -84,6 +103,7 @@ where
         reports: Vec<IdentityStatusReport>,
         cached: bool,
         reason: &str,
+        auto_removal_notices: Vec<AutoRemovalNotice>,
     ) -> Result<AutomaticSelectionResult> {
         let policy = self.policy_store.load()?.policy;
         let health = self.health_store.load()?;
@@ -112,6 +132,7 @@ where
             selected,
             current,
             decision_log,
+            auto_removal_notices,
         })
     }
 }

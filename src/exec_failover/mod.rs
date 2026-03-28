@@ -6,6 +6,9 @@ use crate::decision_log::{DecisionLogService, LoggedSelectionEvent};
 use crate::domain::health::{IdentityFailureKind, IdentityHealthRecord};
 use crate::domain::identity::{current_timestamp, CodexIdentity};
 use crate::error::Result;
+use crate::identity_cleanup::{
+    auto_remove_deactivated_workspace_identities, AutoRemovalNotice, ManagedIdentityRemovalService,
+};
 use crate::identity_health::IdentityHealthService;
 use crate::identity_selection::IdentitySelectionService;
 use crate::identity_selector::{IdentitySelector, RejectionReason, SelectedIdentity};
@@ -47,6 +50,7 @@ pub struct ExecFailoverResult {
     pub launched: Option<LaunchOutcome>,
     pub launched_candidate: Option<SelectedIdentity>,
     pub decision_log: Option<LoggedSelectionEvent>,
+    pub auto_removal_notices: Vec<AutoRemovalNotice>,
 }
 
 impl ExecFailoverResult {
@@ -97,7 +101,7 @@ where
     V: IdentityVerifier + Sync,
 {
     pub fn launch(&self, request: ExecFailoverRequest) -> Result<ExecFailoverResult> {
-        let reports = self.load_reports(request.cached)?;
+        let (reports, auto_removal_notices) = self.load_reports(request.cached)?;
         let policy = self.stores.policy_store.load()?.policy;
         let health_record = self.stores.health_store.load()?;
         let selector = IdentitySelector::new(policy.clone(), current_timestamp()?);
@@ -141,6 +145,7 @@ where
                         launched: Some(outcome),
                         launched_candidate: Some(candidate),
                         decision_log: None,
+                        auto_removal_notices: auto_removal_notices.clone(),
                     };
                     result.decision_log = DecisionLogService::new(
                         &self.stores.decision_store,
@@ -192,6 +197,7 @@ where
             launched: None,
             launched_candidate: None,
             decision_log: None,
+            auto_removal_notices,
         };
         result.decision_log =
             DecisionLogService::new(&self.stores.decision_store, selector, health_record)
@@ -199,15 +205,26 @@ where
         Ok(result)
     }
 
-    fn load_reports(&self, cached: bool) -> Result<Vec<IdentityStatusReport>> {
+    fn load_reports(
+        &self,
+        cached: bool,
+    ) -> Result<(Vec<IdentityStatusReport>, Vec<AutoRemovalNotice>)> {
         let service = QuotaStatusService::new(
             self.stores.registry_store.clone(),
             self.stores.quota_store.clone(),
         );
         if cached {
-            service.cached_statuses()
+            Ok((service.cached_statuses()?, Vec::new()))
         } else {
-            service.refresh_all(&self.verifier)
+            let reports = service.refresh_all(&self.verifier)?;
+            let remover = ManagedIdentityRemovalService::new(
+                self.stores.registry_store.clone(),
+                self.stores.quota_store.clone(),
+                self.stores.health_store.clone(),
+                self.stores.selection_store.clone(),
+            );
+            let sweep = auto_remove_deactivated_workspace_identities(reports, &remover);
+            Ok((sweep.reports, sweep.notices))
         }
     }
 }

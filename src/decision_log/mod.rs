@@ -496,6 +496,7 @@ mod tests {
                 updated_at: 1,
             }),
             refresh_error: None,
+            refresh_error_kind: None,
         }
     }
 
