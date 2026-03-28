@@ -38,6 +38,7 @@ use crate::identity_cleanup::{
     WorkspaceDeactivationSummary,
 };
 use crate::identity_health::IdentityHealthService;
+use crate::identity_naming::next_auto_display_name;
 use crate::identity_registry::IdentityRegistryService;
 use crate::identity_selection::{CurrentIdentitySelection, IdentitySelectionService};
 use crate::identity_selector::{IdentityEvaluation, IdentitySelector, SelectedIdentity};
@@ -190,7 +191,7 @@ enum AddIdentitySubcommand {
 #[derive(Debug, Args)]
 struct AddSharedIdentityArgs {
     #[arg(long)]
-    name: String,
+    name: Option<String>,
     #[arg(long)]
     base_root: Option<PathBuf>,
     #[arg(long)]
@@ -210,7 +211,7 @@ struct AddSharedIdentityArgs {
 #[derive(Debug, Args)]
 struct AddApiIdentityArgs {
     #[arg(long)]
-    name: String,
+    name: Option<String>,
     #[arg(long)]
     base_root: Option<PathBuf>,
     #[arg(long)]
@@ -605,8 +606,9 @@ fn run_add_identity(command: AddIdentityCommand) -> Result<()> {
             validate_add_login_flags(arguments.login, arguments.no_verify)?;
             let base_root = resolve_base_root(arguments.base_root.as_deref())?;
             let service = IdentityRegistryService::new(JsonRegistryStore::new(&base_root));
+            let display_name = resolve_add_identity_name(&service, arguments.name)?;
             let result = service.register_identity(BootstrapIdentityRequest {
-                display_name: arguments.name,
+                display_name,
                 base_root: base_root.clone(),
                 auth_mode: AuthMode::Chatgpt,
                 home_override: arguments.home,
@@ -625,8 +627,9 @@ fn run_add_identity(command: AddIdentityCommand) -> Result<()> {
             validate_add_login_flags(arguments.login, arguments.no_verify)?;
             let base_root = resolve_base_root(arguments.base_root.as_deref())?;
             let service = IdentityRegistryService::new(JsonRegistryStore::new(&base_root));
+            let display_name = resolve_add_identity_name(&service, arguments.name)?;
             let result = service.register_identity(BootstrapIdentityRequest {
-                display_name: arguments.name,
+                display_name,
                 base_root: base_root.clone(),
                 auth_mode: AuthMode::Apikey,
                 home_override: arguments.home,
@@ -1252,6 +1255,19 @@ struct LoadedIdentityReports {
 enum VerifyIdentityOutcome {
     Verified,
     AutoRemoved,
+}
+
+fn resolve_add_identity_name(
+    service: &IdentityRegistryService<JsonRegistryStore>,
+    requested_name: Option<String>,
+) -> Result<String> {
+    match requested_name {
+        Some(name) => Ok(name),
+        None => {
+            let identities = service.list_identities()?;
+            next_auto_display_name(identities.iter().map(|identity| &identity.id))
+        }
+    }
 }
 
 fn load_identity_reports(base_root: &Path, cached: bool) -> Result<LoadedIdentityReports> {

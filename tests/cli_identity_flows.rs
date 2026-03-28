@@ -57,6 +57,86 @@ fn add_and_list_identities() {
 }
 
 #[test]
+fn add_without_name_uses_mythic_auto_names() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "identities",
+            "add",
+            "chatgpt",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registered Atlas"))
+        .stdout(predicate::str::contains("id: atlas"));
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "identities",
+            "add",
+            "api",
+            "--env-var",
+            "CLIENT_A_OPENAI_API_KEY",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registered Vesper"))
+        .stdout(predicate::str::contains("id: vesper"));
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args(["identities", "list", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Atlas (atlas)"))
+        .stdout(predicate::str::contains("Vesper (vesper)"));
+}
+
+#[test]
+fn add_without_name_skips_taken_auto_name_slug() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "identities",
+            "add",
+            "chatgpt",
+            "--name",
+            "Atlas",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .args([
+            "identities",
+            "add",
+            "chatgpt",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registered Vesper"))
+        .stdout(predicate::str::contains("id: vesper"));
+}
+
+#[test]
 fn remove_identity_clears_registry_and_selection() {
     let temp = tempdir().unwrap();
     let base_root = temp.path().join("managed");
@@ -631,6 +711,73 @@ exit 1
 
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("api-fallback|login --with-api-key|sk-live-test"));
+}
+
+#[test]
+fn add_with_login_without_name_uses_generated_identity_name() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let fake_bin_dir = temp.path().join("bin");
+    let log_path = temp.path().join("add-api-login-auto-name-log.txt");
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let fake_codex_path = fake_bin_dir.join("codex");
+    fs::write(
+        &fake_codex_path,
+        r#"#!/bin/sh
+if [ "$1" = "login" ] && [ "$2" = "--with-api-key" ]; then
+  IFS= read -r api_key
+  printf '%s|%s|%s\n' "${CODEX_HOME##*/}" "$*" "$api_key" >> "$FAKE_LOGIN_LOG"
+  exit 0
+fi
+
+echo "unexpected invocation: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&fake_codex_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex_path, permissions).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .env("FAKE_LOGIN_LOG", &log_path)
+        .env("CLIENT_A_OPENAI_API_KEY", "sk-live-test")
+        .args([
+            "identities",
+            "add",
+            "api",
+            "--env-var",
+            "CLIENT_A_OPENAI_API_KEY",
+            "--login",
+            "--no-verify",
+            "--base-root",
+            &base_root_string,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registered Atlas"))
+        .stdout(predicate::str::contains(
+            "login completed for Atlas (atlas)",
+        ))
+        .stdout(predicate::str::contains("verification skipped"));
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("atlas|login --with-api-key|sk-live-test"));
 }
 
 #[test]

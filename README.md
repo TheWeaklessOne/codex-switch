@@ -79,13 +79,13 @@ codex-switch --help
 Register and log in a ChatGPT-backed identity:
 
 ```bash
-codex-switch identities add chatgpt --name "Account 1" --login
+codex-switch identities add chatgpt --login
 ```
 
 Register and log in an API-key-backed identity:
 
 ```bash
-codex-switch identities add api --name "API Fallback" --env-var OPENAI_API_KEY --login --no-verify
+codex-switch identities add api --env-var OPENAI_API_KEY --login --no-verify
 ```
 
 Inspect current accounts and quotas:
@@ -117,16 +117,16 @@ codex-switch exec --auto-failover -- --full-auto
 Identity lifecycle:
 
 ```bash
-codex-switch identities add chatgpt --name "Personal Plus" --login
-codex-switch identities add api --name "API Fallback" --env-var OPENAI_API_KEY --login --no-verify
+codex-switch identities add chatgpt --login
+codex-switch identities add api --env-var OPENAI_API_KEY --login --no-verify
 codex-switch identities list
-codex-switch identities login "Personal Plus"
-codex-switch identities verify "Personal Plus"
-codex-switch identities remove "Personal Plus"
-codex-switch identities disable "Personal Plus"
-codex-switch identities enable "Personal Plus"
+codex-switch identities login "Atlas"
+codex-switch identities verify "Atlas"
+codex-switch identities remove "Atlas"
+codex-switch identities disable "Atlas"
+codex-switch identities enable "Atlas"
 codex-switch identities health show
-codex-switch identities health clear "Personal Plus"
+codex-switch identities health clear "Atlas"
 ```
 
 Selection and status:
@@ -135,7 +135,7 @@ Selection and status:
 codex-switch accounts
 codex-switch status
 codex-switch select
-codex-switch select "Personal Plus"
+codex-switch select "Atlas"
 codex-switch select --auto
 codex-switch policy show
 codex-switch policy set --warning 85 --avoid 95 --hard-stop 100 --rate-limit-cooldown 1800 --auth-failure-cooldown 21600
@@ -146,7 +146,7 @@ Execution:
 ```bash
 codex-switch exec -- --full-auto
 codex-switch exec --auto-failover -- --full-auto
-codex-switch app-server --identity "Personal Plus" -- --listen stdio://
+codex-switch app-server --identity "Atlas" -- --listen stdio://
 ```
 
 Thread continuation and handoff:
@@ -154,8 +154,8 @@ Thread continuation and handoff:
 ```bash
 codex-switch continue --thread <thread-id> --to "Backup Workspace"
 codex-switch continue --thread <thread-id> --auto
-codex-switch threads inspect <thread-id> --identity "Personal Plus"
-codex-switch threads lease acquire <thread-id> --identity "Personal Plus"
+codex-switch threads inspect <thread-id> --identity "Atlas"
+codex-switch threads lease acquire <thread-id> --identity "Atlas"
 codex-switch threads lease show <thread-id>
 codex-switch threads handoff prepare <thread-id> --from "Source" --to "Target" --lease-token <token> --reason quota
 codex-switch threads handoff accept <thread-id> --to "Target" --lease-token <pending-token>
@@ -166,9 +166,9 @@ codex-switch threads state <thread-id>
 Workspace forcing:
 
 ```bash
-codex-switch identities workspace-force show "Personal Plus"
-codex-switch identities workspace-force probe "Personal Plus"
-codex-switch identities workspace-force set "Personal Plus" --status passed --notes "Operator override"
+codex-switch identities workspace-force show "Atlas"
+codex-switch identities workspace-force probe "Atlas"
+codex-switch identities workspace-force set "Atlas" --status passed --notes "Operator override"
 ```
 
 Task orchestration:
@@ -196,7 +196,7 @@ codex-switch scheduler disable
 Machine-facing session orchestration:
 
 ```bash
-codex-switch sessions start --topic-key telegram:chat-123:topic-9 --identity "Personal Plus" --json
+codex-switch sessions start --topic-key telegram:chat-123:topic-9 --identity "Atlas" --json
 codex-switch turns start --session <session-id> --prompt "Investigate the failing tests" --json
 codex-switch turns wait --turn <turn-id> --json
 codex-switch sessions show --session <session-id> --json
