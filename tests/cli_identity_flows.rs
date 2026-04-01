@@ -137,6 +137,78 @@ fn add_without_name_skips_taken_auto_name_slug() {
 }
 
 #[test]
+fn top_level_add_registers_chatgpt_identity_with_auto_name_and_logs_in() {
+    let temp = tempdir().unwrap();
+    let base_root = temp.path().join("managed");
+    let base_root_string = base_root.to_string_lossy().into_owned();
+    let fake_bin_dir = temp.path().join("bin");
+    let log_path = temp.path().join("top-level-add-login-log.txt");
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    let fake_codex_path = fake_bin_dir.join("codex");
+    fs::write(
+        &fake_codex_path,
+        r#"#!/bin/sh
+if [ "$1" = "login" ]; then
+  printf '%s|%s\n' "${CODEX_HOME##*/}" "$*" >> "$FAKE_LOGIN_LOG"
+  exit 0
+fi
+
+if [ "$1" = "app-server" ]; then
+  read line
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2"}}\n' "$id"
+  read _
+  read line
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"jsonrpc":"2.0","id":"%s","result":{"authMethod":"chatgpt"}}\n' "$id"
+  read line
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"jsonrpc":"2.0","id":"%s","result":{"account":{"type":"chatgpt","email":"quick-add@example.com","planType":"plus"},"requiresOpenaiAuth":false}}\n' "$id"
+  read line
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"jsonrpc":"2.0","id":"%s","result":{"rateLimits":{"primary":{"usedPercent":7,"windowDurationMins":300},"secondary":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","limitName":"Codex","planType":"plus","primary":{"usedPercent":7,"windowDurationMins":300,"resetsAt":1700000000},"secondary":null}}}}\n' "$id"
+  exit 0
+fi
+
+echo "unexpected invocation: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&fake_codex_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_codex_path, permissions).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    Command::cargo_bin("codex-switch")
+        .unwrap()
+        .env("PATH", &path)
+        .env("FAKE_LOGIN_LOG", &log_path)
+        .args(["add", "--base-root", &base_root_string])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("registered Atlas"))
+        .stdout(predicate::str::contains(
+            "login completed for Atlas (atlas)",
+        ))
+        .stdout(predicate::str::contains("email: quick-add@example.com"));
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("atlas|login"));
+}
+
+#[test]
 fn remove_identity_clears_registry_and_selection() {
     let temp = tempdir().unwrap();
     let base_root = temp.path().join("managed");

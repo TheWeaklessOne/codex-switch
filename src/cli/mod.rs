@@ -75,6 +75,7 @@ where
 {
     let cli = Cli::parse_from(arguments);
     match cli.command {
+        Command::Add(command) => run_quick_add(command),
         Command::Identities(command) => run_identities(command),
         Command::Policy(command) => run_policy(command),
         Command::Status(command) => run_status(command),
@@ -104,6 +105,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Add(QuickAddCommand),
     Identities(IdentitiesCommand),
     Policy(PolicyCommand),
     Status(StatusCommand),
@@ -121,6 +123,20 @@ enum Command {
     Sessions(SessionsCommand),
     Turns(TurnsCommand),
     Handoffs(HandoffsCommand),
+}
+
+#[derive(Debug, Args)]
+struct QuickAddCommand {
+    #[arg(long)]
+    base_root: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
+    #[arg(long)]
+    overwrite_config: bool,
+    #[arg(long)]
+    workspace_id: Option<String>,
+    #[arg(long)]
+    no_verify: bool,
 }
 
 #[derive(Debug, Args)]
@@ -602,27 +618,7 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
 
 fn run_add_identity(command: AddIdentityCommand) -> Result<()> {
     match command.command {
-        AddIdentitySubcommand::Chatgpt(arguments) => {
-            validate_add_login_flags(arguments.login, arguments.no_verify)?;
-            let base_root = resolve_base_root(arguments.base_root.as_deref())?;
-            let service = IdentityRegistryService::new(JsonRegistryStore::new(&base_root));
-            let display_name = resolve_add_identity_name(&service, arguments.name)?;
-            let result = service.register_identity(BootstrapIdentityRequest {
-                display_name,
-                base_root: base_root.clone(),
-                auth_mode: AuthMode::Chatgpt,
-                home_override: arguments.home,
-                import_auth_from_home: arguments.import_auth_from_home,
-                overwrite_config: arguments.overwrite_config,
-                api_key_env_var: None,
-                forced_chatgpt_workspace_id: arguments.workspace_id,
-            })?;
-            print_registered_identity(&base_root, &result.identity, result.next_login_command);
-            if arguments.login {
-                login_identity(&base_root, &result.identity, arguments.no_verify)?;
-            }
-            Ok(())
-        }
+        AddIdentitySubcommand::Chatgpt(arguments) => run_add_chatgpt_identity(arguments, false),
         AddIdentitySubcommand::Api(arguments) => {
             validate_add_login_flags(arguments.login, arguments.no_verify)?;
             let base_root = resolve_base_root(arguments.base_root.as_deref())?;
@@ -645,6 +641,45 @@ fn run_add_identity(command: AddIdentityCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_quick_add(command: QuickAddCommand) -> Result<()> {
+    run_add_chatgpt_identity(
+        AddSharedIdentityArgs {
+            name: None,
+            base_root: command.base_root,
+            home: command.home,
+            import_auth_from_home: None,
+            overwrite_config: command.overwrite_config,
+            workspace_id: command.workspace_id,
+            login: true,
+            no_verify: command.no_verify,
+        },
+        true,
+    )
+}
+
+fn run_add_chatgpt_identity(arguments: AddSharedIdentityArgs, force_login: bool) -> Result<()> {
+    let should_login = force_login || arguments.login;
+    validate_add_login_flags(should_login, arguments.no_verify)?;
+    let base_root = resolve_base_root(arguments.base_root.as_deref())?;
+    let service = IdentityRegistryService::new(JsonRegistryStore::new(&base_root));
+    let display_name = resolve_add_identity_name(&service, arguments.name)?;
+    let result = service.register_identity(BootstrapIdentityRequest {
+        display_name,
+        base_root: base_root.clone(),
+        auth_mode: AuthMode::Chatgpt,
+        home_override: arguments.home,
+        import_auth_from_home: arguments.import_auth_from_home,
+        overwrite_config: arguments.overwrite_config,
+        api_key_env_var: None,
+        forced_chatgpt_workspace_id: arguments.workspace_id,
+    })?;
+    print_registered_identity(&base_root, &result.identity, result.next_login_command);
+    if should_login {
+        login_identity(&base_root, &result.identity, arguments.no_verify)?;
+    }
+    Ok(())
 }
 
 fn run_list_identities(command: ListIdentitiesCommand) -> Result<()> {

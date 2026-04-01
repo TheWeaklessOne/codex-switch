@@ -79,7 +79,7 @@ codex-switch --help
 Register and log in a ChatGPT-backed identity:
 
 ```bash
-codex-switch identities add chatgpt --login
+codex-switch add
 ```
 
 Register and log in an API-key-backed identity:
@@ -117,7 +117,8 @@ codex-switch exec --auto-failover -- --full-auto
 Identity lifecycle:
 
 ```bash
-codex-switch identities add chatgpt --login
+codex-switch add
+codex-switch add --workspace-id ws_123
 codex-switch identities add api --env-var OPENAI_API_KEY --login --no-verify
 codex-switch identities list
 codex-switch identities login "Atlas"
